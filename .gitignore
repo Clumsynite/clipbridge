@@ -1,0 +1,7 @@
+.build/
+*.app
+hosts/
+*.token
+__pycache__/
+scripts/spike/result-*.txt
+.DS_Store

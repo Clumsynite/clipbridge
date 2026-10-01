@@ -1,0 +1,316 @@
+#!/bin/zsh
+# clipbridge: make the Mac clipboard readable from SSH sessions.
+#
+#   clipbridge install            build ClipBridge.app, start it at login, link this CLI
+#   clipbridge add <alias>        set up an ssh host (forward, remote shims, PATH)
+#   clipbridge remove <alias>     undo add
+#   clipbridge doctor [alias]     check everything end to end
+#   clipbridge pause | resume     stop / start serving the clipboard
+#   clipbridge status             app state, pause state, configured hosts
+set -euo pipefail
+
+ROOT=${0:A:h:h}
+LABEL=com.clumsyknight.clipbridge
+APP=$HOME/Applications/ClipBridge.app
+PLIST=$HOME/Library/LaunchAgents/$LABEL.plist
+CONF=$HOME/.config/clipbridge
+HOSTS=$CONF/hosts
+SSHCONF=$HOME/.ssh/config
+MAC_PORT=7788
+SSH=(ssh -o BatchMode=yes -o ConnectTimeout=10)
+SCP=(scp -q -o BatchMode=yes -o ConnectTimeout=10)
+
+die() { print -u2 "clipbridge: $*"; exit 1; }
+say() { print "clipbridge: $*"; }
+host_file() { print "$HOSTS/$1.json"; }
+json_get() { python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))[sys.argv[2]])' "$1" "$2"; }
+
+app_running() { pgrep -qx ClipBridge; }
+
+# ---------------------------------------------------------------- install
+
+cmd_install() {
+  local bundled
+  bundled=$("$ROOT/scripts/bundle.sh")
+  [[ $bundled == "$APP" ]] || die "bundle step failed"
+  mkdir -p "${PLIST:h}"
+  cat > "$PLIST" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>$LABEL</string>
+  <key>ProgramArguments</key><array><string>$APP/Contents/MacOS/ClipBridge</string></array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
+  <key>ProcessType</key><string>Interactive</string>
+</dict>
+</plist>
+EOF
+  launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
+  pkill -x ClipBridge 2>/dev/null || true
+  sleep 1
+  launchctl bootstrap "gui/$(id -u)" "$PLIST"
+  mkdir -p "$HOME/.local/bin" -m 700 "$HOSTS"
+  chmod 700 "$CONF" "$HOSTS"
+  ln -sf "$ROOT/bin/clipbridge" "$HOME/.local/bin/clipbridge"
+  sleep 1
+  launchctl print "gui/$(id -u)/$LABEL" | grep -q 'state = running' || die "agent didn't start; see ~/Library/Logs/clipbridge.log"
+  say "installed; ClipBridge is running (menu bar)"
+}
+
+# ---------------------------------------------------------------- ssh config block
+
+block_begin() { print "# clipbridge begin $1"; }
+block_end() { print "# clipbridge end $1"; }
+
+# Print ssh config without our block for <alias>.
+strip_block() {
+  local alias=$1 file=$2
+  awk -v b="$(block_begin "$alias")" -v e="$(block_end "$alias")" '
+    $0 == b { skip = 1; next }
+    $0 == e { skip = 0; next }
+    !skip { print }' "$file"
+}
+
+# Pre-existing settings we'd fight with, outside any clipbridge block.
+foreign_settings() {
+  awk '
+    /^# clipbridge begin / { skip = 1; next }
+    /^# clipbridge end / { skip = 0; next }
+    !skip && tolower($0) ~ /^[ \t]*(controlmaster|controlpath|controlpersist|remoteforward)[ \t=]/ { print NR": "$0 }' "$SSHCONF"
+}
+
+write_block() {
+  local alias=$1 port=$2 tmp
+  tmp=$(mktemp)
+  strip_block "$alias" "$SSHCONF" > "$tmp"
+  # Keep a blank line between the last block and ours.
+  [[ -s $tmp && -n $(tail -c1 "$tmp") ]] && print >> "$tmp"
+  cat >> "$tmp" <<EOF
+$(block_begin "$alias")
+Host $alias
+  RemoteForward 127.0.0.1:$port 127.0.0.1:$MAC_PORT
+  ControlMaster auto
+  ControlPath ~/.ssh/cm/%C
+  ControlPersist 10m
+  ServerAliveInterval 15
+  ServerAliveCountMax 3
+$(block_end "$alias")
+EOF
+  cat "$tmp" > "$SSHCONF"
+  rm -f "$tmp"
+}
+
+# ---------------------------------------------------------------- remote rc block
+
+rc_file_for() {
+  case ${1:t} in
+    zsh) print .zshrc ;;
+    bash) print .bashrc ;;
+    *) return 1 ;;
+  esac
+}
+
+# ---------------------------------------------------------------- add
+
+cmd_add() {
+  local alias=${1:?usage: clipbridge add <alias>}
+  [[ $alias =~ '^[A-Za-z0-9._-]+$' ]] || die "alias must be letters, digits, . _ -"
+  [[ -f $SSHCONF ]] || die "no $SSHCONF"
+  local foreign
+  foreign=$(foreign_settings)
+  [[ -z $foreign ]] || die "ssh config already sets ControlMaster/ControlPath/ControlPersist/RemoteForward; resolve first:
+$foreign"
+
+  say "checking $alias"
+  local info
+  info=$("${SSH[@]}" -o ControlPath=none "$alias" 'printf "shell=%s\n" "$SHELL"; command -v python3 >/dev/null && echo python3=yes; for n in clipbridge-shim xclip xsel pbpaste; do f="$HOME/.local/bin/$n"; if [ -L "$f" ]; then echo "link $n $(readlink "$f")"; elif [ -e "$f" ]; then echo "file $n"; fi; done; ss -ltn 2>/dev/null | awk "NR>1{print \"port \" \$4}"') \
+    || die "can't reach $alias non-interactively (needs key auth)"
+  [[ $info == *python3=yes* ]] || die "$alias has no python3"
+  local rshell rc
+  rshell=$(print -r -- "$info" | sed -n 's/^shell=//p')
+  rc=$(rc_file_for "$rshell") || die "remote shell $rshell not supported (zsh or bash)"
+  local conflicts
+  conflicts=$(print -r -- "$info" | awk '$1=="file" && $2!="clipbridge-shim" {print $2} $1=="link" && $3!="clipbridge-shim" {print $2}')
+  [[ -z $conflicts ]] || die "$alias already has these in ~/.local/bin (not ours): ${(f)conflicts}"
+
+  mkdir -p -m 700 "$HOSTS"
+  local hf port token
+  hf=$(host_file "$alias")
+  if [[ -f $hf ]]; then
+    port=$(json_get "$hf" port)
+    token=$(json_get "$hf" token_hex)
+  else
+    local used
+    used=$(print -r -- "$info" | sed -n 's/^port .*:\([0-9]*\)$/\1/p')
+    for _ in {1..50}; do
+      port=$(( 20000 + RANDOM % 12768 ))
+      print -r -- "$used" | grep -qx "$port" || break
+    done
+    token=$(python3 -c 'import secrets; print(secrets.token_hex(32))')
+  fi
+
+  local backup=$SSHCONF.bak-clipbridge-$(date +%Y%m%d-%H%M%S)
+  cp -p "$SSHCONF" "$backup"
+  local created_host=0
+  [[ -f $hf ]] || created_host=1
+  rollback() {
+    say "failed; restoring $SSHCONF from $backup"
+    cp -p "$backup" "$SSHCONF"
+    (( created_host )) && rm -f "$hf"
+  }
+  trap 'rollback' ZERR
+  trap - ERR
+
+  (umask 077; print -r -- "{\"host\": \"$alias\", \"port\": $port, \"token_hex\": \"$token\"}" > "$hf")
+  write_block "$alias" "$port"
+  mkdir -p -m 700 "$HOME/.ssh/cm"
+
+  # Drop any master started before the forward existed, so the next connection carries it.
+  "${SSH[@]}" -O exit "$alias" 2>/dev/null || true
+
+  "${SSH[@]}" "$alias" 'mkdir -p ~/.local/bin && umask 077 && mkdir -p ~/.config/clipbridge'
+  "${SCP[@]}" "$ROOT/remote/clipbridge-shim" "$alias:.local/bin/clipbridge-shim"
+  "${SSH[@]}" "$alias" 'cd ~/.local/bin && chmod 755 clipbridge-shim && for n in xclip xsel pbpaste; do ln -sfn clipbridge-shim "$n"; done'
+  print -r -- "{\"host\": \"$alias\", \"port\": $port, \"token_hex\": \"$token\"}" \
+    | "${SSH[@]}" "$alias" 'umask 077; cat > ~/.config/clipbridge/config.json; chmod 600 ~/.config/clipbridge/config.json; chmod 700 ~/.config/clipbridge'
+  "${SSH[@]}" "$alias" "f=~/$rc; touch \$f; awk '/^# clipbridge begin\$/{s=1;next} /^# clipbridge end\$/{s=0;next} !s' \$f > \$f.cb-tmp && cat \$f.cb-tmp > \$f && rm \$f.cb-tmp && printf '\n# clipbridge begin\nexport PATH=\"\$HOME/.local/bin:\$PATH\"\n# clipbridge end\n' >> \$f"
+
+  trap - ZERR
+  say "added $alias (remote port $port). Open a new ssh session, then run: clipbridge doctor $alias"
+}
+
+# ---------------------------------------------------------------- remove
+
+cmd_remove() {
+  local alias=${1:?usage: clipbridge remove <alias>}
+  local hf port=""
+  hf=$(host_file "$alias")
+  [[ -f $hf ]] && port=$(json_get "$hf" port)
+  if [[ -n $port ]]; then
+    "${SSH[@]}" -O cancel -R "127.0.0.1:$port:127.0.0.1:$MAC_PORT" "$alias" 2>/dev/null || true
+  fi
+  "${SSH[@]}" -o ControlPath=none "$alias" 'cd ~/.local/bin 2>/dev/null && for n in xclip xsel pbpaste; do [ -L "$n" ] && [ "$(readlink "$n")" = clipbridge-shim ] && rm -f "$n"; done; rm -f ~/.local/bin/clipbridge-shim; rm -rf ~/.config/clipbridge; for f in ~/.zshrc ~/.bashrc; do [ -f "$f" ] && awk "/^# clipbridge begin\$/{s=1;next} /^# clipbridge end\$/{s=0;next} !s" "$f" > "$f.cb-tmp" && cat "$f.cb-tmp" > "$f" && rm "$f.cb-tmp"; done; true' \
+    || say "warning: couldn't clean up $alias remotely"
+  if grep -qx "$(block_begin "$alias")" "$SSHCONF"; then
+    cp -p "$SSHCONF" "$SSHCONF.bak-clipbridge-$(date +%Y%m%d-%H%M%S)"
+    local tmp
+    tmp=$(mktemp)
+    strip_block "$alias" "$SSHCONF" > "$tmp"
+    cat "$tmp" > "$SSHCONF"
+    rm -f "$tmp"
+  fi
+  rm -f "$hf"
+  say "removed $alias"
+}
+
+# ---------------------------------------------------------------- pause / status
+
+cmd_pause() { mkdir -p -m 700 "$CONF"; : > "$CONF/paused"; say "paused"; }
+cmd_resume() { rm -f "$CONF/paused"; say "resumed"; }
+
+cmd_status() {
+  app_running && print "app: running" || print "app: not running"
+  [[ -f $CONF/paused ]] && print "state: paused" || print "state: on"
+  local f
+  for f in "$HOSTS"/*.json(N); do print "host: ${f:t:r} (remote port $(json_get "$f" port))"; done
+}
+
+# ---------------------------------------------------------------- doctor
+
+cmd_doctor() {
+  local alias=${1:-}
+  local fail=0
+  ok() { print "  ok    $*"; }
+  bad() { print "  FAIL  $*"; fail=1; }
+  warn() { print "  warn  $*"; }
+
+  print "mac"
+  app_running && ok "ClipBridge running" || bad "ClipBridge not running (clipbridge install)"
+  lsof -nP -iTCP:$MAC_PORT -sTCP:LISTEN 2>/dev/null | grep -q "127.0.0.1:$MAC_PORT" && ok "listening on 127.0.0.1:$MAC_PORT only" || bad "nothing on 127.0.0.1:$MAC_PORT"
+  [[ -f $CONF/paused ]] && warn "paused (clipbridge resume)"
+
+  [[ -z $alias ]] && { (( fail )) && exit 1 || exit 0; }
+  local hf
+  hf=$(host_file "$alias")
+  [[ -f $hf ]] || die "$alias isn't set up (clipbridge add $alias)"
+  local port
+  port=$(json_get "$hf" port)
+
+  local mac_kind="" mac_sum=""
+  local out
+  if out=$("$ROOT/scripts/dev-request.py" --host "$alias" image 2>/dev/null); then
+    mac_kind=image; mac_sum=${${(s: :)out}[2]}
+  elif out=$("$ROOT/scripts/dev-request.py" --host "$alias" text 2>/dev/null); then
+    mac_kind=text; mac_sum=${${(s: :)out}[2]}
+  fi
+  if [[ -n $mac_kind ]]; then ok "signed local request ($mac_kind)"; else warn "no fresh image or text on the clipboard"; fi
+
+  print "ssh config"
+  local g
+  g=$(ssh -G "$alias" 2>/dev/null)
+  local want
+  for want in "remoteforward [127.0.0.1]:$port [127.0.0.1]:$MAC_PORT" "controlmaster auto" "controlpersist 600" "serveraliveinterval 15"; do
+    print -r -- "$g" | grep -qxF "$want" && ok "$want" || bad "ssh -G lacks: $want"
+  done
+  print -r -- "$g" | grep -qE "^controlpath $HOME/\.ssh/cm/[0-9a-f]{40}$" && ok "controlpath ~/.ssh/cm/%C" || bad "controlpath not ~/.ssh/cm/%C"
+
+  print "remote $alias"
+  local r
+  r=$("${SSH[@]}" "$alias" 'echo "clock=$(date +%s)"; command -v python3 >/dev/null && echo python3=yes; ss -ltnp 2>/dev/null | grep -E "127\.0\.0\.1:'"$port"'[[:space:]]" || echo "listener=none"') || bad "ssh $alias failed"
+  local rclock
+  rclock=$(print -r -- "$r" | sed -n 's/^clock=//p')
+  if [[ -n $rclock ]]; then
+    local skew=$(( rclock - $(date +%s) ))
+    (( ${skew#-} <= 30 )) && ok "clock skew ${skew}s" || bad "clock skew ${skew}s (> 30s; requests will get 401)"
+  fi
+  [[ $r == *python3=yes* ]] && ok "python3" || bad "no python3"
+  if [[ $r == *listener=none* ]]; then
+    bad "nothing listening on remote 127.0.0.1:$port (open a new ssh session; if one is open from before 'add', run: ssh -O exit $alias)"
+  elif print -r -- "$r" | grep -q 'users:(("sshd'; then
+    ok "remote 127.0.0.1:$port is our ssh forward"
+  elif print -r -- "$r" | grep -q 'users:(('; then
+    bad "remote 127.0.0.1:$port is held by another process of yours, not sshd: $(print -r -- "$r" | grep -o 'users:.*')"
+  else
+    # sshd holds forwards in a process ss can't attribute to you; signed responses guard the rest.
+    ok "remote 127.0.0.1:$port listening (owner not visible; responses are signature-checked below)"
+  fi
+
+  local rl
+  rl=$("${SSH[@]}" -T "$alias" '"$SHELL" -lic "for n in xclip xsel pbpaste; do printf \"which %s %s\n\" \$n \"\$(command -v \$n)\"; done; printf \"claude %s\n\" \"\$(claude --version 2>/dev/null)\"" 2>/dev/null' || true)
+  local n got
+  for n in xclip xsel pbpaste; do
+    got=$(print -r -- "$rl" | sed -n "s/^which $n //p" | tail -1)
+    [[ $got == */.local/bin/$n ]] && ok "$n -> $got" || bad "$n resolves to '${got:-nothing}' in a login shell (want ~/.local/bin/$n; re-login or check ~/.zshrc)"
+  done
+  local cv
+  cv=$(print -r -- "$rl" | sed -n 's/^claude //p' | tail -1)
+  # Claude Code builds that read the clipboard natively could skip xclip; the harness is the real test.
+  [[ -n $cv ]] && ok "claude $cv (after a Claude update, recheck with: scripts/spike/run.sh $alias --real)"
+
+  if [[ -n $mac_kind ]]; then
+    local cmd
+    [[ $mac_kind == image ]] && cmd='xclip -selection clipboard -t image/png -o' || cmd='pbpaste'
+    local rs
+    rs=$("${SSH[@]}" -T "$alias" "\"\$SHELL\" -lic '$cmd | sha256sum' 2>/dev/null" | grep -oE '^[0-9a-f]{64}' | tail -1 || true)
+    [[ $rs == "$mac_sum" ]] && ok "round trip ($mac_kind) sha256 matches" || bad "round trip ($mac_kind): mac $mac_sum, remote ${rs:-none}"
+  fi
+
+  (( fail )) && exit 1
+  [[ -z $mac_kind ]] && { print "nothing-to-test: copy an image or text and rerun"; exit 3; }
+  exit 0
+}
+
+# ---------------------------------------------------------------- main
+
+case ${1:-} in
+  install) cmd_install ;;
+  add) shift; cmd_add "$@" ;;
+  remove) shift; cmd_remove "$@" ;;
+  doctor) shift; cmd_doctor "$@" ;;
+  pause) cmd_pause ;;
+  resume) cmd_resume ;;
+  status) cmd_status ;;
+  *) sed -n '2,10s/^# \{0,1\}//p' "$0"; exit 2 ;;
+esac

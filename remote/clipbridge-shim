@@ -1,0 +1,207 @@
+#!/usr/bin/env python3
+"""clipbridge remote shim: serves the Mac clipboard to xclip / xsel / pbpaste readers.
+
+Installed once as ~/.local/bin/clipbridge-shim with xclip, xsel and pbpaste symlinked to it.
+Only clipboard *reads* are served, through the ssh RemoteForward to the Mac's ClipBridge app.
+Everything else (writes, the primary selection, unknown flags), or an unreachable Mac, runs
+the real tool of the same name if there is one. Config: ~/.config/clipbridge/config.json.
+"""
+import hashlib
+import hmac
+import json
+import os
+import secrets
+import socket
+import sys
+import time
+
+CONNECT_TIMEOUT = 1.0
+DEADLINE = 20.0
+TEXT_TARGETS = {"text/plain", "text/plain;charset=utf-8", "UTF8_STRING", "STRING", "TEXT"}
+CLIPBOARD_NAMES = {"c", "cl", "cli", "clip", "clipb", "clipbo", "clipboa", "clipboar", "clipboard"}
+
+
+class Unreachable(Exception):
+    """Nothing listening, or not our server's protocol at all: fall through to the real tool."""
+
+
+class Rejected(Exception):
+    """Our server answered but there's nothing to serve, or the answer failed verification."""
+
+
+def config_path():
+    return os.environ.get("CLIPBRIDGE_CONFIG") or os.path.expanduser("~/.config/clipbridge/config.json")
+
+
+def load_config():
+    try:
+        with open(config_path()) as f:
+            c = json.load(f)
+        return c["host"], int(c["port"]), bytes.fromhex(c["token_hex"])
+    except (OSError, ValueError, KeyError):
+        raise Unreachable()
+
+
+def fetch(kind):
+    """GET /v1/<kind> from the forward. Returns the body of a verified, non-empty 200."""
+    host, port, key = load_config()
+    path = "/v1/" + kind
+    ts, nonce = str(int(time.time())), secrets.token_hex(16)
+    mac = hmac.new(key, ("req|%s|%s|%s|%s" % (path, host, ts, nonce)).encode(), hashlib.sha256).hexdigest()
+    deadline = time.monotonic() + DEADLINE
+    try:
+        sock = socket.create_connection(("127.0.0.1", port), timeout=CONNECT_TIMEOUT)
+    except OSError:
+        raise Unreachable()
+    try:
+        req = "GET %s?host=%s&ts=%s&nonce=%s HTTP/1.1\r\nHost: 127.0.0.1\r\nX-CB-Auth: %s\r\nConnection: close\r\n\r\n" % (
+            path, host, ts, nonce, mac)
+        sock.sendall(req.encode())
+        buf = bytearray()
+        while True:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                raise Rejected()
+            sock.settimeout(min(left, 5.0))
+            try:
+                chunk = sock.recv(65536)
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            if not chunk:
+                break
+            buf += chunk
+    finally:
+        sock.close()
+    if not buf:
+        # A forward with no Mac behind it accepts and closes at once.
+        raise Unreachable()
+    head, sep, body = bytes(buf).partition(b"\r\n\r\n")
+    if not sep:
+        raise Rejected()
+    lines = head.decode("latin-1").split("\r\n")
+    parts = lines[0].split(" ")
+    if len(parts) < 2 or not parts[0].startswith("HTTP/1."):
+        raise Rejected()
+    status = int(parts[1]) if parts[1].isdigit() else 0
+    headers = {}
+    for line in lines[1:]:
+        name, _, value = line.partition(":")
+        headers[name.strip().lower()] = value.strip()
+    length = headers.get("content-length")
+    if length is None or not length.isdigit() or int(length) != len(body):
+        raise Rejected()
+    want = hmac.new(key, ("resp|%s|%d|%s" % (nonce, status, hashlib.sha256(body).hexdigest())).encode(),
+                    hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(want, headers.get("x-cb-sig", "")):
+        raise Rejected()
+    if status != 200 or not body:
+        raise Rejected()
+    return body
+
+
+def real_tool(name):
+    """The first `name` on PATH that isn't this shim."""
+    me = os.path.realpath(__file__)
+    for d in os.environ.get("PATH", "").split(os.pathsep):
+        cand = os.path.join(d or ".", name)
+        if os.path.isfile(cand) and os.access(cand, os.X_OK) and os.path.realpath(cand) != me:
+            return cand
+    return None
+
+
+def passthrough(name, args):
+    real = real_tool(name)
+    if real is None:
+        sys.exit(1)
+    os.execv(real, [name] + args)
+
+
+# --- argv parsing per tool. Each returns the route to serve ("targets"/"image"/"text") or None.
+
+def xclip_route(args):
+    selection, target, out = "primary", None, False
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a in ("-o", "-out"):
+            out = True
+        elif a in ("-selection", "-sel", "-se") and i + 1 < len(args):
+            selection = args[i + 1].lower()
+            i += 1
+        elif a in ("-t", "-target") and i + 1 < len(args):
+            target = args[i + 1]
+            i += 1
+        elif a in ("-quiet", "-silent", "-noutf8", "-q"):
+            pass
+        else:
+            return None  # -i, -f, -l, -d, files, … : not a plain clipboard read
+        i += 1
+    if not out or selection not in CLIPBOARD_NAMES:
+        return None
+    if target is None or target in TEXT_TARGETS:
+        return "text"
+    if target == "TARGETS":
+        return "targets"
+    if target.startswith("image/"):
+        return "image"
+    return "unsupported"
+
+
+def xsel_route(args):
+    clip, out = False, False
+    for a in args:
+        if a in ("-b", "--clipboard"):
+            clip = True
+        elif a in ("-o", "--output"):
+            out = True
+        elif a in ("-n", "--nodetach", "-v", "--verbose"):
+            pass
+        elif a.startswith("-") and not a.startswith("--") and len(a) > 2 and set(a[1:]) <= {"b", "o"}:
+            clip = clip or "b" in a
+            out = out or "o" in a
+        else:
+            return None
+    return "text" if clip and out else None
+
+
+def pbpaste_route(args):
+    i = 0
+    while i < len(args):
+        if args[i] in ("-Prefer", "-pboard") and i + 1 < len(args):
+            i += 2
+            continue
+        return None
+    return "text"
+
+
+ROUTERS = {"xclip": xclip_route, "xsel": xsel_route, "pbpaste": pbpaste_route}
+
+
+def main():
+    name = os.path.basename(sys.argv[0])
+    args = sys.argv[1:]
+    router = ROUTERS.get(name)
+    if router is None:
+        sys.stderr.write("clipbridge-shim: run me as xclip, xsel or pbpaste\n")
+        sys.exit(2)
+    route = router(args)
+    if route is None:
+        passthrough(name, args)
+    if route == "unsupported":
+        sys.exit(1)
+    try:
+        body = fetch(route)
+    except Unreachable:
+        passthrough(name, args)
+    except Rejected:
+        sys.exit(1)
+    out = sys.stdout.buffer
+    out.write(body)
+    out.flush()
+    sys.exit(0)
+
+
+if __name__ == "__main__":
+    main()
