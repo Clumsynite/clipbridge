@@ -1,7 +1,13 @@
 #!/usr/bin/env python3
 # Spike stub: logs argv, serves a fixed 16x16 PNG for image requests.
-import base64, os, sys, time
-PNG = base64.b64decode("iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAIAAACQkWg2AAAAFklEQVR4nGOQq7hDEmIY1TCqYfhqAAD2K3IQoc2C5QAAAABJRU5ErkJggg==")
+import base64
+import os
+import sys
+import time
+
+PNG = base64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAIAAACQkWg2AAAAFklEQVR4nGOQq7hDEmIY1TCqYfhqAAD2K3IQoc2C5QAAAABJRU5ErkJggg=="
+)
 log = os.path.expanduser("~/.cache/cb-spike/log")
 with open(log, "a") as f:
     f.write("%d %s\n" % (time.time(), " ".join(sys.argv[1:])))

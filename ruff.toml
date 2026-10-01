@@ -1,0 +1,7 @@
+# Lint config for the Python bits (remote shim, its tests, dev scripts). Stdlib only, Python 3.8+.
+line-length = 120
+target-version = "py38"
+include = ["remote/clipbridge-shim", "remote/*.py", "scripts/*.py", "scripts/spike/stub-xclip"]
+
+[lint]
+select = ["E", "F", "W", "B"]

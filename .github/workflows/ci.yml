@@ -1,0 +1,67 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: shellcheck
+        run: |
+          shellcheck -s sh remote/clipbridge-attach
+          shellcheck -s bash scripts/*.sh scripts/spike/run.sh scripts/spike/run-remote.sh
+      - name: ruff
+        run: pipx run ruff check .
+      - name: actionlint
+        run: |
+          bash <(curl -sSfL https://raw.githubusercontent.com/rhysd/actionlint/main/scripts/download-actionlint.bash)
+          ./actionlint -color
+
+  # The shim runs on the remote Linux boxes, so test it on Linux.
+  shim:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python: ["3.10", "3.12"]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Shim tests
+        run: python -m unittest discover -s remote -p 'test_*.py' -v
+
+  app:
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0 # build number = commit count
+      - name: Toolchain
+        run: swift --version && xcodebuild -version
+      - name: CLI syntax
+        run: zsh -n bin/clipbridge
+      - name: Build
+        run: swift build
+      - name: Test
+        run: swift test
+      - name: Package
+        run: scripts/package.sh
+      - name: Upload build
+        uses: actions/upload-artifact@v4
+        with:
+          name: ClipBridge-${{ github.sha }}
+          path: dist/*
+          retention-days: 14

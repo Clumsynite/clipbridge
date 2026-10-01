@@ -1,10 +1,26 @@
 # clipbridge
 
-> How it works, with diagrams, the IP-matching gotcha and troubleshooting: [HOW-IT-WORKS.md](HOW-IT-WORKS.md)
+[![CI](https://github.com/Clumsynite/clipbridge/actions/workflows/ci.yml/badge.svg)](https://github.com/Clumsynite/clipbridge/actions/workflows/ci.yml)
+[![Release](https://github.com/Clumsynite/clipbridge/actions/workflows/release.yml/badge.svg)](https://github.com/Clumsynite/clipbridge/actions/workflows/release.yml)
+[![Version](https://img.shields.io/badge/version-0.1.0-blue)](../../releases/latest)
+![macOS](https://img.shields.io/badge/macOS-14%2B-black?logo=apple)
+![Targets](https://img.shields.io/badge/targets-Linux%20over%20SSH-E95420?logo=ubuntu&logoColor=white)
+![Swift](https://img.shields.io/badge/Swift-6-F05138?logo=swift&logoColor=white)
+![Python](https://img.shields.io/badge/shim-python3%20stdlib-3776AB?logo=python&logoColor=white)
+![Dependencies](https://img.shields.io/badge/dependencies-none-brightgreen)
 
 Read your Mac clipboard from SSH sessions. Copy an image or text on the Mac, and on the remote box
 `xclip -o`, `xsel -b -o` and `pbpaste` return it. That includes Claude Code: Ctrl+V in a remote Claude
 Code session attaches the image you just copied (or pastes the text).
+
+<p align="center">
+  <img src="docs/menu.png" width="420" alt="ClipBridge menu: status, a warning with a Fix action, hosts, recent pulls">
+  &nbsp;
+  <img src="docs/add-host.png" width="340" alt="Add a host dialog">
+</p>
+
+> **How it works**, with diagrams, the shared-account model, the IP-matching gotcha and troubleshooting:
+> [HOW-IT-WORKS.md](HOW-IT-WORKS.md)
 
 It's one-way, Mac → remote. Nothing is pushed: the remote pulls on demand through your existing SSH
 connection, and only when a program asks for the clipboard.
@@ -17,7 +33,22 @@ Mac: ClipBridge.app (menu bar)                         remote (Ubuntu)
 
 ## Install
 
-On the Mac (needs Xcode / Swift 6):
+**From a release** (no Xcode needed):
+
+1. Download `ClipBridge-<version>.zip` from the [latest release](../../releases/latest). The repository
+   is private, so you need access to it, or use
+   `gh release download -R Clumsynite/clipbridge -p 'ClipBridge-*.zip'`.
+2. Unzip it somewhere permanent. The CLI keeps running from there, e.g.:
+   ```sh
+   mkdir -p ~/.local/share/clipbridge && ditto -x -k ClipBridge-*.zip ~/.local/share/clipbridge
+   ~/.local/share/clipbridge/ClipBridge-*/bin/clipbridge install
+   ```
+   `install` copies the app to `~/Applications`, clears the download quarantine (the app is ad-hoc
+   signed), starts it at login and links `clipbridge` into `~/.local/bin`.
+3. In the menu bar: **Add host…** → pick your ssh alias. Or from a terminal:
+   `clipbridge add <ssh-alias>`, then `clipbridge doctor <ssh-alias>`.
+
+**From source** (needs Xcode / Swift 6):
 
 ```sh
 bin/clipbridge install          # builds ~/Applications/ClipBridge.app, starts it at login, links the CLI
@@ -142,12 +173,49 @@ let g:clipboard = {'name': 'clipbridge', 'paste': {'+': 'pbpaste', '*': 'pbpaste
   shows it. That test starts Claude Code in tmux on the remote, presses Ctrl+V and looks for
   `[Image #1]`.
 
+<p align="center"><img src="docs/doctor.svg" width="640" alt="clipbridge doctor output, all checks ok"></p>
+
 ## Development
 
 ```sh
-swift test                                            # core: auth, nonces, freshness, images, HTTP
+swift test                                            # core: auth, nonces, freshness, images, HTTP, sessions
 python3 -m unittest discover -s remote -p 'test_*.py' # shim against a fake server
-scripts/bundle.sh                                     # build + install the app
+scripts/bundle.sh [--no-install]                      # build the app (and install it to ~/Applications)
+scripts/package.sh                                    # release kit: dist/ClipBridge-<version>.zip + SHA256SUMS
 scripts/dev-request.py --host <alias> image|text|targets   # signed request to the local app
 scripts/spike/run.sh <alias> [--real]                 # live Claude Code paste test on a host
 ```
+
+**Lint** (what CI runs):
+
+```sh
+shellcheck -s sh remote/clipbridge-attach && shellcheck -s bash scripts/*.sh scripts/spike/*.sh
+uvx ruff check .            # or: pipx run ruff check .
+zsh -n bin/clipbridge
+actionlint
+```
+
+**Screenshots:** the app has a demo mode with made-up hosts, so no real infrastructure ends up in
+`docs/`:
+
+```sh
+BIN=$(swift build --show-bin-path)/ClipBridge
+$BIN --demo --open-menu          # pops the menu up with sample hosts, a warning and recent pulls
+$BIN --demo --add-host-dialog    # the Add host dialog
+python3 scripts/make-doctor-svg.py   # docs/doctor.svg
+```
+
+## CI and releases
+
+- **CI** (`.github/workflows/ci.yml`) runs on every push and pull request:
+  - **lint:** shellcheck, ruff, actionlint
+  - **shim:** the shim tests on Linux, Python 3.10 and 3.12
+  - **app:** on macOS, `swift build`, `swift test` and the packaged kit, uploaded as a build artifact
+- **Releases** come from CI/CD, never from hand-made tags:
+  ```sh
+  scripts/bump-version.sh patch    # or minor / major / 1.2.3: updates VERSION + the badge, commits
+  git push                         # CI runs; when it passes, Release publishes v<version>
+  ```
+  The Release workflow (`.github/workflows/release.yml`) runs after a successful CI run on `main`. If
+  `v<VERSION>` doesn't exist yet, it tests, builds `ClipBridge-<version>.zip` with `SHA256SUMS.txt`
+  at that commit, and publishes the release with generated notes. Otherwise it does nothing.

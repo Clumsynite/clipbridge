@@ -6,7 +6,15 @@ Prints "<status> <sha256-of-body> <bytes>" after verifying the response signatur
 Exit 0 on a verified 200, 1 otherwise. The token is read from
 ~/.config/clipbridge/hosts/<alias>.json, never from argv.
 """
-import argparse, hashlib, hmac, http.client, json, os, secrets, sys, time
+import argparse
+import hashlib
+import hmac
+import http.client
+import json
+import os
+import secrets
+import sys
+import time
 
 p = argparse.ArgumentParser()
 p.add_argument("--host", required=True)

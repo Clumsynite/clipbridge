@@ -148,12 +148,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
     private var busy: String?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        try? FileManager.default.createDirectory(at: Paths.hosts, withIntermediateDirectories: true,
-                                                 attributes: [.posixPermissions: 0o700])
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         let menu = NSMenu()
         menu.delegate = self
         statusItem.menu = menu
+
+        if Demo.on {
+            // Sample data for screenshots: no server, no files, no key rotation, no real hosts.
+            recent = Demo.recent
+            warnings = Demo.warnings
+            updateIcon()
+            if CommandLine.arguments.contains("--open-menu") {
+                // Pop up at a fixed spot: the status item itself may be hidden behind the notch.
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1) {
+                    self.menuNeedsUpdate(menu)
+                    menu.popUp(positioning: nil, at: NSPoint(x: 200, y: 1000), in: nil)
+                }
+            }
+            if CommandLine.arguments.contains("--add-host-dialog") {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1) { _ = Dialog.addHost(aliases: Demo.aliases) }
+            }
+            return
+        }
+
+        try? FileManager.default.createDirectory(at: Paths.hosts, withIntermediateDirectories: true,
+                                                 attributes: [.posixPermissions: 0o700])
         updateIcon()
 
         if #available(macOS 15.4, *) {
@@ -238,9 +257,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
         statusItem.button?.image?.isTemplate = true
     }
 
+    private func currentHosts() -> [HostInfo] {
+        Demo.on ? Demo.hosts : HostInfo.loadAll(from: Paths.hosts)
+    }
+
+    private func currentWarnings() -> [HostWarning] {
+        Demo.on ? Demo.warnings : HostWarning.compute(hosts: currentHosts(), sessions: SSHSession.running())
+    }
+
     private func refreshWarnings() {
         DispatchQueue.global(qos: .utility).async {
-            let w = HostWarning.compute(hosts: HostInfo.loadAll(from: Paths.hosts), sessions: SSHSession.running())
+            let w = Demo.on ? Demo.warnings
+                : HostWarning.compute(hosts: HostInfo.loadAll(from: Paths.hosts), sessions: SSHSession.running())
             DispatchQueue.main.async {
                 MainActor.assumeIsolated {
                     self.warnings = w
@@ -260,7 +288,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
         menu.addItem(.separator())
 
         // Warnings are recomputed every 20 s; recompute now too, synchronously (ps is quick).
-        warnings = HostWarning.compute(hosts: HostInfo.loadAll(from: Paths.hosts), sessions: SSHSession.running())
+        warnings = currentWarnings()
         updateIcon()
         for w in warnings {
             let i = item(w.title, #selector(fixWarning(_:)))
@@ -270,7 +298,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
         }
         if !warnings.isEmpty { menu.addItem(.separator()) }
 
-        let hosts = HostInfo.loadAll(from: Paths.hosts)
+        let hosts = currentHosts()
         menu.addItem(withTitle: hosts.isEmpty ? "No hosts yet" : "Hosts", action: nil, keyEquivalent: "")
         for h in hosts {
             let hi = NSMenuItem(title: "  \(h.host)", action: nil, keyEquivalent: "")
@@ -366,7 +394,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
     }
 
     @objc private func addHost() {
-        let existing = Set(HostInfo.loadAll(from: Paths.hosts).map(\.host))
+        let existing = Set(currentHosts().map(\.host))
         let aliases = SSHConfig.aliases(in: (try? String(contentsOf: Paths.home.appendingPathComponent(".ssh/config"), encoding: .utf8)) ?? "").filter { !existing.contains($0) }
         guard !aliases.isEmpty else {
             Dialog.message("No ssh aliases to add", "Every Host in ~/.ssh/config is already set up, or there are none. Add a Host entry for the box first.")
@@ -398,7 +426,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
 
     @objc private func addNames(_ sender: NSMenuItem) {
         guard let host = sender.representedObject as? String,
-              let h = HostInfo.loadAll(from: Paths.hosts).first(where: { $0.host == host }) else { return }
+              let h = currentHosts().first(where: { $0.host == host }) else { return }
         let suggestions = (h.ips ?? []).filter { !h.matched.contains($0) }
         guard let names = Dialog.addNames(host: host, suggestions: suggestions) else { return }
         add(host, names)
@@ -477,6 +505,40 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
                                             withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void) {
         completionHandler([.banner])
     }
+}
+
+/// Made-up hosts, warnings and pulls for README screenshots (`--demo`). Nothing real is shown.
+enum Demo {
+    static let on = CommandLine.arguments.contains("--demo")
+    static let aliases = ["devbox", "gpu-server", "staging", "build-01"]
+
+    static let hosts: [HostInfo] = {
+        let now = Date().timeIntervalSince1970
+        let json = """
+            [{"host": "devbox", "port": 23187, "also": ["192.168.1.40"],
+              "ips": ["192.168.1.40", "100.64.0.12", "10.0.0.12"], "added": \(now - 86400), "rotated": \(now - 600),
+              "names_added": {"devbox": \(now - 86400), "100.64.0.12": \(now - 86400), "192.168.1.40": \(now - 3600)}},
+             {"host": "gpu-server", "port": 28841, "also": [], "ips": ["100.64.0.31"], "added": \(now - 7200),
+              "rotated": \(now - 600), "names_added": {"gpu-server": \(now - 7200), "100.64.0.31": \(now - 7200)}}]
+            """
+        return (try? JSONDecoder().decode([HostInfo].self, from: Data(json.utf8))) ?? []
+    }()
+
+    static let warnings: [HostWarning] = {
+        let now = Date()
+        return HostWarning.compute(hosts: hosts, sessions: [
+            SSHSession(pid: 4242, started: now.addingTimeInterval(-300), destination: "10.0.0.12"),
+        ])
+    }()
+
+    static let recent: [PullEvent] = {
+        let now = Date()
+        return [
+            PullEvent(date: now.addingTimeInterval(-40), host: "devbox", path: "/v1/image", status: 200, bytes: 412_311, reason: nil),
+            PullEvent(date: now.addingTimeInterval(-380), host: "gpu-server", path: "/v1/text", status: 200, bytes: 1_204, reason: nil),
+            PullEvent(date: now.addingTimeInterval(-920), host: "devbox", path: "/v1/image", status: 200, bytes: 1_893_002, reason: nil),
+        ]
+    }()
 }
 
 // Debug/diagnostic: print what the menu would warn about, then exit.

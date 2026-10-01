@@ -1,0 +1,27 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="582" height="443" viewBox="0 0 582 443">
+<rect width="582" height="443" rx="10" fill="#1e1f24"/>
+<path d="M0 10a10 10 0 0 1 10-10h562a10 10 0 0 1 10 10v18H0z" fill="#2b2d33"/>
+<circle cx="18" cy="14" r="6" fill="#ff5f57"/><circle cx="38" cy="14" r="6" fill="#febc2e"/><circle cx="58" cy="14" r="6" fill="#28c840"/>
+<text x="291.0" y="18" fill="#8b919c" font-family="-apple-system, Helvetica, sans-serif" font-size="12" text-anchor="middle">clipbridge doctor</text>
+<g font-family="SFMono-Regular, Menlo, Consolas, monospace" font-size="14" xml:space="preserve">
+<text x="18" y="54" fill="#61afef">$ clipbridge doctor devbox</text>
+<text x="18" y="74" fill="#e5c07b">mac</text>
+<text x="18" y="94"><tspan fill="#5fd38d">  ok    </tspan><tspan fill="#d7dae0">ClipBridge running</tspan></text>
+<text x="18" y="114"><tspan fill="#5fd38d">  ok    </tspan><tspan fill="#d7dae0">listening on 127.0.0.1:7788 only</tspan></text>
+<text x="18" y="134"><tspan fill="#5fd38d">  ok    </tspan><tspan fill="#d7dae0">signed local request (image)</tspan></text>
+<text x="18" y="154" fill="#e5c07b">ssh config</text>
+<text x="18" y="174"><tspan fill="#5fd38d">  ok    </tspan><tspan fill="#d7dae0">remoteforward [127.0.0.1]:23187 [127.0.0.1]:7788</tspan></text>
+<text x="18" y="194"><tspan fill="#5fd38d">  ok    </tspan><tspan fill="#d7dae0">controlmaster auto</tspan></text>
+<text x="18" y="214"><tspan fill="#5fd38d">  ok    </tspan><tspan fill="#d7dae0">controlpath ~/.ssh/cm/%C</tspan></text>
+<text x="18" y="234"><tspan fill="#5fd38d">  ok    </tspan><tspan fill="#d7dae0">setenv LC_CLIPBRIDGE=&lt;session key&gt;</tspan></text>
+<text x="18" y="254"><tspan fill="#5fd38d">  ok    </tspan><tspan fill="#d7dae0">~/.config/clipbridge/ssh_config is 0600</tspan></text>
+<text x="18" y="274" fill="#e5c07b">remote devbox</text>
+<text x="18" y="294"><tspan fill="#5fd38d">  ok    </tspan><tspan fill="#d7dae0">clock skew 0s</tspan></text>
+<text x="18" y="314"><tspan fill="#5fd38d">  ok    </tspan><tspan fill="#d7dae0">no key stored on the box</tspan></text>
+<text x="18" y="334"><tspan fill="#5fd38d">  ok    </tspan><tspan fill="#d7dae0">new sessions carry the session key</tspan></text>
+<text x="18" y="354"><tspan fill="#5fd38d">  ok    </tspan><tspan fill="#d7dae0">xclip -&gt; /home/dev/.local/bin/xclip</tspan></text>
+<text x="18" y="374"><tspan fill="#5fd38d">  ok    </tspan><tspan fill="#d7dae0">pbpaste -&gt; /home/dev/.local/bin/pbpaste</tspan></text>
+<text x="18" y="394"><tspan fill="#5fd38d">  ok    </tspan><tspan fill="#d7dae0">a shell without your session key can&#x27;t read the clipboard</tspan></text>
+<text x="18" y="414"><tspan fill="#5fd38d">  ok    </tspan><tspan fill="#d7dae0">round trip (image) sha256 matches</tspan></text>
+</g>
+</svg>

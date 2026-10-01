@@ -1,0 +1,64 @@
+name: Release
+
+# Releases come from CI/CD, never hand-made tags: bump VERSION (scripts/bump-version.sh) and push
+# to main. When CI passes on that push, this builds the app at the tested commit and publishes
+# release v<VERSION> with the kit zip. If that release already exists, it does nothing.
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push')
+    runs-on: macos-26
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ env.SHA }}
+          fetch-depth: 0
+      - name: Read version
+        id: v
+        run: |
+          version=$(tr -d '[:space:]' < VERSION)
+          echo "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' \
+            || { echo "::error::VERSION '$version' is not x.y.z"; exit 1; }
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          if gh release view "v$version" > /dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "Release v$version already exists; nothing to do."
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Test
+        if: steps.v.outputs.exists == 'false'
+        run: swift test
+      - name: Package
+        if: steps.v.outputs.exists == 'false'
+        run: scripts/package.sh
+      - name: Publish
+        if: steps.v.outputs.exists == 'false'
+        env:
+          VERSION: ${{ steps.v.outputs.version }}
+        run: |
+          gh release create "v$VERSION" dist/* \
+            --target "$SHA" \
+            --title "ClipBridge $VERSION" \
+            --generate-notes \
+            --notes "**Install:** download \`ClipBridge-$VERSION.zip\`, unzip it somewhere permanent (e.g. \`~/.local/share/clipbridge\`), then run \`ClipBridge-$VERSION/bin/clipbridge install\` and **Add host…** from the menu bar. The app is ad-hoc signed; \`install\` clears the download quarantine for you."

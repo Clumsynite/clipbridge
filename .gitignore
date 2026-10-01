@@ -5,3 +5,4 @@ hosts/
 __pycache__/
 scripts/spike/result-*.txt
 .DS_Store
+dist/

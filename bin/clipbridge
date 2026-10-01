@@ -9,6 +9,7 @@
 #   clipbridge doctor [alias]     check everything end to end
 #   clipbridge pause | resume     stop / start serving the clipboard
 #   clipbridge status             app state, pause state, configured hosts
+#   clipbridge version
 set -euo pipefail
 
 ROOT=${0:A:h:h}
@@ -32,9 +33,18 @@ app_running() { pgrep -qx ClipBridge; }
 # ---------------------------------------------------------------- install
 
 cmd_install() {
-  local bundled
-  bundled=$("$ROOT/scripts/bundle.sh")
-  [[ $bundled == "$APP" ]] || die "bundle step failed"
+  if [[ -d $ROOT/ClipBridge.app ]]; then
+    # Release kit: use the prebuilt app. A downloaded zip is quarantined; this is your own install.
+    mkdir -p "${APP:h}"
+    rm -rf "$APP"
+    ditto "$ROOT/ClipBridge.app" "$APP"
+    xattr -dr com.apple.quarantine "$APP" 2>/dev/null || true
+  else
+    # Source checkout: build it (needs Xcode / Swift 6).
+    local bundled
+    bundled=$("$ROOT/scripts/bundle.sh")
+    [[ $bundled == "$APP" ]] || die "bundle step failed"
+  fi
   mkdir -p "${PLIST:h}"
   cat > "$PLIST" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -53,7 +63,8 @@ EOF
   pkill -x ClipBridge 2>/dev/null || true
   sleep 1
   launchctl bootstrap "gui/$(id -u)" "$PLIST"
-  mkdir -p "$HOME/.local/bin" -m 700 "$HOSTS"
+  mkdir -p "$HOME/.local/bin"
+  mkdir -p -m 700 "$CONF" "$HOSTS"
   chmod 700 "$CONF" "$HOSTS"
   ln -sf "$ROOT/bin/clipbridge" "$HOME/.local/bin/clipbridge"
   sleep 1
@@ -442,5 +453,6 @@ case ${1:-} in
   pause) cmd_pause ;;
   resume) cmd_resume ;;
   status) cmd_status ;;
+  version | --version) print "clipbridge $(tr -d '[:space:]' < "$ROOT/VERSION" 2>/dev/null || print dev)" ;;
   *) sed -n '2,10s/^# \{0,1\}//p' "$0"; exit 2 ;;
 esac

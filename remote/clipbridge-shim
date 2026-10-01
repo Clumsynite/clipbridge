@@ -86,10 +86,12 @@ def fetch(kind):
     try:
         sock = socket.create_connection(("127.0.0.1", port), timeout=CONNECT_TIMEOUT)
     except OSError:
-        raise Unreachable()
+        raise Unreachable() from None
     try:
-        req = "GET %s?host=%s&ts=%s&nonce=%s HTTP/1.1\r\nHost: 127.0.0.1\r\nX-CB-Auth: %s\r\nConnection: close\r\n\r\n" % (
-            path, host, ts, nonce, mac)
+        req = (
+            "GET %s?host=%s&ts=%s&nonce=%s HTTP/1.1\r\n"
+            "Host: 127.0.0.1\r\nX-CB-Auth: %s\r\nConnection: close\r\n\r\n"
+        ) % (path, host, ts, nonce, mac)
         sock.sendall(req.encode())
         buf = bytearray()
         while True:

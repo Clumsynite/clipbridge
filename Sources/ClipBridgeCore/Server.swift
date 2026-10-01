@@ -69,6 +69,15 @@ public struct PullEvent: Sendable {
     public let bytes: Int
     public let reason: String?
 
+    public init(date: Date, host: String?, path: String, status: Int, bytes: Int, reason: String?) {
+        self.date = date
+        self.host = host
+        self.path = path
+        self.status = status
+        self.bytes = bytes
+        self.reason = reason
+    }
+
     public var logLine: String {
         var s = "pull host=\(host ?? "-") path=\(path) status=\(status) bytes=\(bytes)"
         if let reason { s += " reason=\(reason)" }

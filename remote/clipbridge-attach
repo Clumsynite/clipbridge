@@ -43,7 +43,7 @@ trap 'clear_key; exit 143' TERM
 if ! tmux show-options -t "$target" update-environment 2>/dev/null | grep -q 'LC_CLIPBRIDGE'; then
   list=$(tmux show-options -t "$target" -v update-environment 2>/dev/null)
   [ -n "$list" ] || list=$(tmux show-options -g -v update-environment 2>/dev/null)
-  tmux set-option -t "$target" update-environment "$(echo $list) LC_CLIPBRIDGE" || exit 1
+  tmux set-option -t "$target" update-environment "$(printf '%s\n' "$list" | tr '\n' ' ')LC_CLIPBRIDGE" || exit 1
 fi
 if [ $# -eq 0 ]; then
   tmux attach -t "$target"

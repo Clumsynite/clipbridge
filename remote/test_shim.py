@@ -334,7 +334,8 @@ class ShimTest(unittest.TestCase):
         p = subprocess.Popen(["pbpaste"], env=self.env(real=False), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         try:
             time.sleep(1.0)
-            ps = subprocess.run(["/bin/ps", "-ww", "-o", "args", "-p", str(p.pid)], capture_output=True, text=True).stdout
+            ps = subprocess.run(["/bin/ps", "-ww", "-o", "args", "-p", str(p.pid)],
+                                capture_output=True, text=True).stdout
             self.assertIn("pbpaste", ps)
             self.assertNotIn(KEY.hex(), ps)
             # Request MAC and the request line also never carry the token.

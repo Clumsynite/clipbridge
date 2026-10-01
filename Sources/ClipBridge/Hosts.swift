@@ -51,9 +51,19 @@ enum Dialog {
         NSApp.activate(ignoringOtherApps: true)
     }
 
+    /// Alerts default to the app icon; ClipBridge has none, so use the menu-bar symbol instead.
+    static func alert() -> NSAlert {
+        let a = NSAlert()
+        if let img = NSImage(systemSymbolName: "doc.on.clipboard", accessibilityDescription: "ClipBridge")?
+            .withSymbolConfiguration(.init(pointSize: 40, weight: .regular)) {
+            a.icon = img
+        }
+        return a
+    }
+
     static func message(_ title: String, _ text: String, monospaced: Bool = false) {
         activate()
-        let a = NSAlert()
+        let a = alert()
         a.messageText = title
         if monospaced {
             let scroll = NSScrollView(frame: NSRect(x: 0, y: 0, width: 560, height: 300))
@@ -73,7 +83,7 @@ enum Dialog {
 
     static func confirm(_ title: String, _ text: String, ok: String, destructive: Bool = false) -> Bool {
         activate()
-        let a = NSAlert()
+        let a = alert()
         a.messageText = title
         a.informativeText = text
         let b = a.addButton(withTitle: ok)
@@ -85,7 +95,7 @@ enum Dialog {
     /// Returns (alias, extra names) or nil if cancelled.
     static func addHost(aliases: [String]) -> (String, [String])? {
         activate()
-        let a = NSAlert()
+        let a = alert()
         a.messageText = "Add a host"
         a.informativeText = """
             Pick the ssh alias from ~/.ssh/config. clipbridge adds a forward for it, installs the xclip / xsel / \
@@ -116,7 +126,7 @@ enum Dialog {
     /// Asks for extra names/IPs for an existing host.
     static func addNames(host: String, suggestions: [String]) -> [String]? {
         activate()
-        let a = NSAlert()
+        let a = alert()
         a.messageText = "Also match \(host) by…"
         a.informativeText = suggestions.isEmpty
             ? "IPs or names you ssh to for this box (space-separated)."
