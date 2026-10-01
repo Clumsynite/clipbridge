@@ -142,7 +142,7 @@ $foreign"
 
   say "checking $alias"
   local info
-  info=$("${SSH[@]}" -o ControlPath=none -o ClearAllForwardings=yes "$alias" 'printf "shell=%s\n" "$SHELL"; command -v python3 >/dev/null && echo python3=yes; for n in clipbridge-shim xclip xsel pbpaste; do f="$HOME/.local/bin/$n"; if [ -L "$f" ]; then echo "link $n $(readlink "$f")"; elif [ -e "$f" ]; then echo "file $n"; fi; done; ss -ltn 2>/dev/null | awk "NR>1{print \"port \" \$4}"') \
+  info=$("${SSH[@]}" -o ControlPath=none -o ClearAllForwardings=yes "$alias" 'printf "shell=%s\n" "$SHELL"; command -v python3 >/dev/null && echo python3=yes; for n in clipbridge-shim xclip xsel pbpaste; do f="$HOME/.local/bin/$n"; if [ -L "$f" ]; then echo "link $n $(readlink "$f")"; elif [ -e "$f" ]; then echo "file $n"; fi; done; ss -ltn 2>/dev/null | awk "NR>1{print \"port \" \$4}"; for a in $(hostname -I 2>/dev/null); do case $a in *:*) ;; *) echo "ip $a" ;; esac; done') \
     || die "can't reach $alias non-interactively (needs key auth)"
   [[ $info == *python3=yes* ]] || die "$alias has no python3"
   local rshell rc
@@ -184,8 +184,33 @@ $foreign"
 
   for n in $also; do [[ " $names " == *" $n "* ]] || names+=" $n"; done
   names=${names# }
-  (umask 077; python3 -c 'import json,sys; json.dump({"host": sys.argv[1], "port": int(sys.argv[2]), "token_hex": sys.argv[3], "also": sys.argv[4].split()}, open(sys.argv[5], "w"))' \
-    "$alias" "$port" "$token" "$names" "$hf")
+  local ips hn
+  ips=$(print -r -- "$info" | sed -n 's/^ip //p' | tr '\n' ' ')
+  hn=$(ssh -G "$alias" 2>/dev/null | awk '$1 == "hostname" { print $2 }')
+  # Host JSON (Mac only, 0600). Besides the token: which names the ssh block matches and since
+  # when (names_added), and the box's own IPv4 addresses (ips), so the app can spot an ssh
+  # session that reached this box by a name the block doesn't match.
+  (umask 077; python3 - "$hf" "$alias" "$port" "$token" "$names" "$ips" "$hn" <<'PY'
+import json, os, sys, time
+hf, alias, port, token, also, ips, hn = sys.argv[1:8]
+old = {}
+if os.path.exists(hf):
+    try:
+        old = json.load(open(hf))
+    except ValueError:
+        pass
+now = int(time.time())
+matched = [alias] + ([hn] if hn and hn != alias else []) + also.split()
+names_added = {n: t for n, t in old.get("names_added", {}).items() if n in matched}
+for n in matched:
+    names_added.setdefault(n, now)
+json.dump({
+    "host": alias, "port": int(port), "token_hex": token,
+    "also": also.split(), "ips": ips.split(),
+    "added": old.get("added", now), "names_added": names_added,
+}, open(hf, "w"), indent=2)
+PY
+  )
   write_block "$alias" "$port" "$names"
   mkdir -p -m 700 "$HOME/.ssh/cm"
 
@@ -200,7 +225,11 @@ $foreign"
   "${SSH[@]}" "$alias" "f=~/$rc; touch \$f; awk '/^# clipbridge begin\$/{s=1;next} /^# clipbridge end\$/{s=0;next} !s' \$f > \$f.cb-tmp && cat \$f.cb-tmp > \$f && rm \$f.cb-tmp && printf '\n# clipbridge begin\nexport PATH=\"\$HOME/.local/bin:\$PATH\"\n# clipbridge end\n' >> \$f"
 
   trap - ZERR
+  local others="" a
+  for a in ${=ips}; do [[ " $alias $hn $names " == *" $a "* ]] || others+=" $a"; done
   say "added $alias (remote port $port). Open a new ssh session, then run: clipbridge doctor $alias"
+  [[ -n $others ]] && print "other-ips:$others" && say "if you also ssh to it as${others}, run: clipbridge add $alias --also <ip>"
+  return 0
 }
 
 # ---------------------------------------------------------------- remove

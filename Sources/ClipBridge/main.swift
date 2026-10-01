@@ -143,7 +143,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
     private let freshness = Freshness()
     private var recent: [PullEvent] = []
     private var notifyAllowed = false
-    private var lastPaused: Bool?
+    private var lastIcon: String?
+    private var warnings: [HostWarning] = []
+    private var busy: String?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         try? FileManager.default.createDirectory(at: Paths.hosts, withIntermediateDirectories: true,
@@ -167,6 +169,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
                 self.freshness.observe(changeCount: NSPasteboard.general.changeCount, now: Date())
                 self.updateIcon()
             }
+        }
+
+        refreshWarnings()
+        Timer.scheduledTimer(withTimeInterval: 20, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated { self?.refreshWarnings() }
         }
 
         let center = UNUserNotificationCenter.current()
@@ -219,11 +226,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
 
     private func updateIcon() {
         let paused = Settings.paused
-        guard paused != lastPaused else { return }
-        lastPaused = paused
-        let name = paused ? "pause.circle" : "doc.on.clipboard"
+        let name = paused ? "pause.circle" : warnings.contains { $0.kind == .unmatchedAddress } ? "exclamationmark.triangle" : "doc.on.clipboard"
+        guard name != lastIcon else { return }
+        lastIcon = name
         statusItem.button?.image = NSImage(systemSymbolName: name, accessibilityDescription: paused ? "ClipBridge paused" : "ClipBridge")
         statusItem.button?.image?.isTemplate = true
+    }
+
+    private func refreshWarnings() {
+        DispatchQueue.global(qos: .utility).async {
+            let w = HostWarning.compute(hosts: HostInfo.loadAll(from: Paths.hosts), sessions: SSHSession.running())
+            DispatchQueue.main.async {
+                MainActor.assumeIsolated {
+                    self.warnings = w
+                    self.updateIcon()
+                }
+            }
+        }
     }
 
     // MARK: menu
@@ -233,6 +252,53 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
         let paused = Settings.paused
         menu.addItem(withTitle: paused ? "ClipBridge: Paused" : "ClipBridge: On", action: nil, keyEquivalent: "")
         menu.addItem(item(paused ? "Resume" : "Pause", #selector(togglePause)))
+        menu.addItem(.separator())
+
+        // Warnings are recomputed every 20 s; recompute now too, synchronously (ps is quick).
+        warnings = HostWarning.compute(hosts: HostInfo.loadAll(from: Paths.hosts), sessions: SSHSession.running())
+        updateIcon()
+        for w in warnings {
+            let i = item(w.title, #selector(fixWarning(_:)))
+            i.representedObject = w
+            if w.kind == .openedBeforeSetup { i.toolTip = "These sessions were opened before clipbridge matched this name, so they have no forward. Exit and reconnect them. pids: \(w.pids.map(String.init).joined(separator: " "))" }
+            menu.addItem(i)
+        }
+        if !warnings.isEmpty { menu.addItem(.separator()) }
+
+        let hosts = HostInfo.loadAll(from: Paths.hosts)
+        menu.addItem(withTitle: hosts.isEmpty ? "No hosts yet" : "Hosts", action: nil, keyEquivalent: "")
+        for h in hosts {
+            let hi = NSMenuItem(title: "  \(h.host)", action: nil, keyEquivalent: "")
+            let sub = NSMenu()
+            let m = NSMenuItem(title: "Matches: \(h.matched.joined(separator: ", "))", action: nil, keyEquivalent: "")
+            m.isEnabled = false
+            sub.addItem(m)
+            let others = (h.ips ?? []).filter { !h.matched.contains($0) }
+            if !others.isEmpty {
+                let o = NSMenuItem(title: "Not matched: \(others.joined(separator: ", "))", action: nil, keyEquivalent: "")
+                o.isEnabled = false
+                sub.addItem(o)
+            }
+            sub.addItem(.separator())
+            for (title, sel) in [("Also match another IP or name…", #selector(addNames(_:))),
+                                 ("Run doctor", #selector(runDoctor(_:))),
+                                 ("Remove…", #selector(removeHost(_:)))] {
+                let i = item(title, sel)
+                i.representedObject = h.host
+                i.isEnabled = busy == nil
+                sub.addItem(i)
+            }
+            hi.submenu = sub
+            menu.addItem(hi)
+        }
+        if let busy {
+            let b = NSMenuItem(title: "  \(busy)…", action: nil, keyEquivalent: "")
+            b.isEnabled = false
+            menu.addItem(b)
+        }
+        let add = item("Add host…", #selector(addHost))
+        add.isEnabled = busy == nil
+        menu.addItem(add)
         menu.addItem(.separator())
 
         let fresh = NSMenuItem(title: "Serve copies from the last…", action: nil, keyEquivalent: "")
@@ -273,6 +339,97 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
         return i
     }
 
+    // MARK: host actions (all through the clipbridge CLI)
+
+    private func runCLI(_ label: String, _ args: [String], then: @escaping @MainActor (CLI.Result) -> Void) {
+        busy = label
+        CLI.run(args) { result in
+            DispatchQueue.main.async {
+                MainActor.assumeIsolated {
+                    self.busy = nil
+                    self.refreshWarnings()
+                    then(result)
+                }
+            }
+        }
+    }
+
+    private static func clean(_ output: String) -> String {
+        output.split(separator: "\n").filter { !$0.hasPrefix("other-ips:") }
+            .map { $0.replacingOccurrences(of: "clipbridge: ", with: "") }.joined(separator: "\n")
+    }
+
+    @objc private func addHost() {
+        let existing = Set(HostInfo.loadAll(from: Paths.hosts).map(\.host))
+        let aliases = SSHConfig.aliases(in: (try? String(contentsOf: Paths.home.appendingPathComponent(".ssh/config"), encoding: .utf8)) ?? "").filter { !existing.contains($0) }
+        guard !aliases.isEmpty else {
+            Dialog.message("No ssh aliases to add", "Every Host in ~/.ssh/config is already set up, or there are none. Add a Host entry for the box first.")
+            return
+        }
+        guard let (alias, extra) = Dialog.addHost(aliases: aliases) else { return }
+        add(alias, extra)
+    }
+
+    private func add(_ alias: String, _ extra: [String]) {
+        runCLI("Setting up \(alias)", ["add", alias] + extra.flatMap { ["--also", $0] }) { r in
+            guard r.status == 0 else {
+                Dialog.message("Couldn't set up \(alias)", Self.clean(r.output), monospaced: true)
+                return
+            }
+            let others = r.output.split(separator: "\n").first { $0.hasPrefix("other-ips:") }
+                .map { $0.dropFirst("other-ips:".count).split(separator: " ").map(String.init) } ?? []
+            if !others.isEmpty,
+               Dialog.confirm("\(alias) also answers on other addresses",
+                              "\(others.joined(separator: ", "))\n\nIf you ever ssh to it by one of these (LAN vs Tailscale, say), that session won't see the clipboard unless it's matched too. Match them now?",
+                              ok: "Match all") {
+                self.add(alias, others)
+                return
+            }
+            Dialog.message("\(alias) is ready",
+                           "Open a NEW ssh session to it (sessions opened before this have no forward), then press Ctrl+V in Claude Code, or run pbpaste.\n\n\(Self.clean(r.output))")
+        }
+    }
+
+    @objc private func addNames(_ sender: NSMenuItem) {
+        guard let host = sender.representedObject as? String,
+              let h = HostInfo.loadAll(from: Paths.hosts).first(where: { $0.host == host }) else { return }
+        let suggestions = (h.ips ?? []).filter { !h.matched.contains($0) }
+        guard let names = Dialog.addNames(host: host, suggestions: suggestions) else { return }
+        add(host, names)
+    }
+
+    @objc private func fixWarning(_ sender: NSMenuItem) {
+        guard let w = sender.representedObject as? HostWarning else { return }
+        switch w.kind {
+        case .unmatchedAddress:
+            guard Dialog.confirm("Match \(w.host) by \(w.destination)?",
+                                 "You're connected to \(w.host) as \(w.destination), which clipbridge doesn't match, so that session has no clipboard. clipbridge will add \(w.destination) to the host's ssh block. Reconnect the session afterwards.",
+                                 ok: "Match \(w.destination)") else { return }
+            add(w.host, [w.destination])
+        case .openedBeforeSetup:
+            Dialog.message("Reconnect these sessions",
+                           "\(w.pids.count == 1 ? "This ssh session" : "These ssh sessions") to \(w.host) (\(w.destination)) started before clipbridge matched that name, so they have no forward to the Mac. Exit them and ssh in again.\n\npids: \(w.pids.map(String.init).joined(separator: " "))")
+        }
+    }
+
+    @objc private func runDoctor(_ sender: NSMenuItem) {
+        guard let host = sender.representedObject as? String else { return }
+        runCLI("Checking \(host)", ["doctor", host]) { r in
+            let verdict = r.status == 0 ? "All checks passed" : r.status == 3 ? "Copy an image or text, then run again" : "Problems found"
+            Dialog.message("\(host): \(verdict)", r.output, monospaced: true)
+        }
+    }
+
+    @objc private func removeHost(_ sender: NSMenuItem) {
+        guard let host = sender.representedObject as? String,
+              Dialog.confirm("Remove \(host)?",
+                             "Removes the shims, config and PATH line from \(host), and its block from ~/.ssh/config (a backup is kept).",
+                             ok: "Remove", destructive: true) else { return }
+        runCLI("Removing \(host)", ["remove", host]) { r in
+            Dialog.message(r.status == 0 ? "\(host) removed" : "Couldn't remove \(host)", Self.clean(r.output), monospaced: r.status != 0)
+        }
+    }
+
     @objc private func togglePause() {
         Settings.setPaused(!Settings.paused)
         updateIcon()
@@ -301,6 +458,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
                                             withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void) {
         completionHandler([.banner])
     }
+}
+
+// Debug/diagnostic: print what the menu would warn about, then exit.
+if CommandLine.arguments.contains("--print-warnings") {
+    let hosts = HostInfo.loadAll(from: Paths.hosts)
+    for h in hosts { print("host \(h.host): matches \(h.matched.joined(separator: " ")); box ips \((h.ips ?? []).joined(separator: " "))") }
+    let w = HostWarning.compute(hosts: hosts, sessions: SSHSession.running())
+    if w.isEmpty { print("no warnings") }
+    for x in w { print("\(x.title)  [pids \(x.pids.map(String.init).joined(separator: " "))]") }
+    exit(0)
 }
 
 MainActor.assumeIsolated {

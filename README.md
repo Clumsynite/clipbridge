@@ -1,5 +1,7 @@
 # clipbridge
 
+> How it works, with diagrams, the IP-matching gotcha and troubleshooting: [HOW-IT-WORKS.md](HOW-IT-WORKS.md)
+
 Read your Mac clipboard from SSH sessions. Copy an image or text on the Mac, and on the remote box
 `xclip -o`, `xsel -b -o` and `pbpaste` return it. That includes Claude Code: Ctrl+V in a remote Claude
 Code session attaches the image you just copied (or pastes the text).
@@ -40,6 +42,11 @@ different IP (LAN vs Tailscale, say), add it with `--also` or that connection wo
 The names are remembered, so running `add` again keeps them.
 
 Open a **new** ssh session after `add`. A connection opened before it has no forward.
+
+Or from the menu bar: **Add host…** picks an alias from `~/.ssh/config` and offers to match the box's
+other IPs. Each host's submenu has **Also match another IP or name…**, **Run doctor** and **Remove…**.
+The menu also warns, and offers a fix, when one of your running ssh sessions reached a set-up box by an
+unmatched address or was opened before setup.
 
 Other commands:
 
