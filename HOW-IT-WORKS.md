@@ -254,15 +254,26 @@ Run **Run doctor** from the host's submenu, or `clipbridge doctor <alias>`. It c
 
 ## Undo
 
-**Remove…** in the host's submenu, or `clipbridge remove <alias>`. This:
-- deletes the shims, `clipbridge-attach` and the PATH block on the box
-- deletes the block from `~/.ssh/config` (with a backup)
-- deletes the host's token file
+**Remove one host:** **Remove…** in the host's submenu, or `clipbridge remove <alias>`. On the box this
+deletes:
+- the shims and `clipbridge-attach`
+- the PATH block in `~/.zshrc`/`~/.bashrc`, restored byte for byte
+- the tmux settings `clipbridge-attach` made
+- any test leftovers (`~/.cache/cb-spike` and its trust entry in `~/.claude.json`)
 
-To uninstall the app:
+On the Mac it deletes the host's key and its Host block. It reports anything it couldn't remove.
 
-```sh
-launchctl bootout gui/$(id -u)/com.clumsyknight.clipbridge
-rm ~/Library/LaunchAgents/com.clumsyknight.clipbridge.plist
-rm -r ~/Applications/ClipBridge.app
-```
+**Remove everything:** `clipbridge uninstall` (asks first; `-y` to skip the question). It removes every
+host as above, then on the Mac:
+- the app, its login item and its LaunchServices registration
+- its privacy permissions and preferences
+- the log
+- the `~/.local/bin/clipbridge` link
+- `~/.config/clipbridge`
+- the block in `~/.ssh/config`, which leaves the file exactly as it was before clipbridge
+- the `~/.ssh/config.bak-clipbridge-*` backups (keep them with `--keep-backups`)
+- `~/.ssh/cm`, once no ssh connection is using it
+
+At the end it checks that nothing is left and says if something is. Only two things are left to you: the
+release folder you installed from (it tells you where), and any ssh connection still open, which closes
+within 10 minutes of your last session.

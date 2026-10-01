@@ -5,6 +5,7 @@
 #   clipbridge add <alias> [--also <ip>]...   set up an ssh host (forward, remote shims, PATH);
 #                                 --also: other names/IPs you ssh to for the same box
 #   clipbridge remove <alias>     undo add
+#   clipbridge uninstall [-y]     remove everything install and add did (Mac and boxes)
 #   clipbridge rotate <alias>|--all   new session keys (open sessions must reconnect)
 #   clipbridge doctor [alias]     check everything end to end
 #   clipbridge pause | resume     stop / start serving the clipboard
@@ -145,6 +146,13 @@ sync_ssh_config() {
   rm -f "$tmp"
 }
 
+# A shared ssh connection (ControlMaster) hands every new session the key and forwards it was opened
+# with. After a key or forward change, tell it to stop taking new sessions: the ones already open on
+# it keep running, and the next session opens a fresh connection with the current settings.
+retire_master() {
+  "${SSH[@]}" -O stop "$1" >/dev/null 2>&1 || true
+}
+
 hosts_count() { local -a f; f=("$HOSTS"/*.json(N)); print ${#f}; }
 
 # ---------------------------------------------------------------- remote rc block
@@ -254,14 +262,27 @@ PY
   write_include
   sync_ssh_config 1
   mkdir -p -m 700 "$HOME/.ssh/cm"
-  # No need to restart an existing ControlMaster: each new session reads the include file and sends
-  # the current key itself. (Exiting the master would also close every open session on it.)
+  retire_master "$alias"
 
   "${SSH[@]}" "$alias" 'mkdir -p ~/.local/bin'
   "${SCP[@]}" "$ROOT/remote/clipbridge-shim" "$ROOT/remote/clipbridge-attach" "$alias:.local/bin/"
   # Key on disk from older versions: remove it. The key now only travels in your sessions' env.
   "${SSH[@]}" "$alias" 'cd ~/.local/bin && chmod 755 clipbridge-shim clipbridge-attach && for n in xclip xsel pbpaste; do ln -sfn clipbridge-shim "$n"; done; rm -f ~/.config/clipbridge/config.json; rmdir ~/.config/clipbridge 2>/dev/null; true'
-  "${SSH[@]}" "$alias" "f=~/$rc; touch \$f; awk '/^# clipbridge begin\$/{s=1;next} /^# clipbridge end\$/{s=0;next} !s' \$f > \$f.cb-tmp && cat \$f.cb-tmp > \$f && rm \$f.cb-tmp && printf '\n# clipbridge begin\nexport PATH=\"\$HOME/.local/bin:\$PATH\"\n# clipbridge end\n' >> \$f"
+  # PATH block in the shell rc: replace ours in place. The exact inverse of REMOTE_CLEANUP, which
+  # removes "\n# clipbridge begin … end\n", so repeated adds and a final uninstall leave no trace.
+  "${SSH[@]}" -T "$alias" "python3 - ~/$rc" <<'PY'
+import re, sys
+p = sys.argv[1]
+try:
+    s = open(p).read()
+except FileNotFoundError:
+    s = ""
+s = re.sub(r"\n?# clipbridge begin\n.*?# clipbridge end\n", "", s, flags=re.S)
+if s and not s.endswith("\n"):
+    s += "\n"
+s += '\n# clipbridge begin\nexport PATH="$HOME/.local/bin:$PATH"\n# clipbridge end\n'
+open(p, "w").write(s)
+PY
 
   trap - ZERR
   [[ -n $hf_backup ]] && rm -f "$hf_backup"
@@ -274,16 +295,96 @@ PY
 
 # ---------------------------------------------------------------- remove
 
-cmd_remove() {
-  local alias=${1:?usage: clipbridge remove <alias>}
-  local hf port=""
-  hf=$(host_file "$alias")
-  [[ -f $hf ]] && port=$(json_get "$hf" port)
+# Everything clipbridge (or its test harness) ever puts on a box, removed. Runs on the box via sh -s.
+# Prints "left: …" for anything it couldn't remove, and "clean" when nothing is left.
+REMOTE_CLEANUP=$(cat <<'REMOTE'
+cd "$HOME" || exit 1
+b=$HOME/.local/bin
+for n in xclip xsel pbpaste; do
+  [ -L "$b/$n" ] && [ "$(readlink "$b/$n")" = clipbridge-shim ] && rm -f "$b/$n"
+done
+rm -f "$b/clipbridge-shim" "$b/clipbridge-attach"
+rm -rf "$HOME/.config/clipbridge" "$HOME/.cache/cb-spike"
+# The PATH block (and the blank line add put before it) in shell rc files.
+for f in "$HOME/.zshrc" "$HOME/.bashrc"; do
+  [ -f "$f" ] || continue
+  python3 - "$f" <<'PY'
+import re, sys
+p = sys.argv[1]
+s = open(p).read()
+t = re.sub(r"\n?# clipbridge begin\n.*?# clipbridge end\n", "", s, flags=re.S)
+if t != s:
+    open(p, "w").write(t)
+PY
+done
+# tmux: undo what clipbridge-attach set on sessions (their own update-environment list, and the key).
+if command -v tmux >/dev/null 2>&1 && tmux list-sessions >/dev/null 2>&1; then
+  tmux list-sessions -F '#{session_name}' | while read -r s; do
+    if tmux show-options -t "$s" update-environment 2>/dev/null | grep -q LC_CLIPBRIDGE; then
+      tmux set-option -t "$s" -u update-environment
+    fi
+    tmux set-environment -t "$s" -u LC_CLIPBRIDGE 2>/dev/null
+  done
+fi
+# The trust entry the paste test left in Claude Code's config (only that exact folder).
+if [ -f "$HOME/.claude.json" ]; then
+  python3 - "$HOME/.claude.json" "$HOME/.cache/cb-spike/ws" <<'PY'
+import json, os, sys
+p, ws = sys.argv[1:3]
+try:
+    d = json.load(open(p))
+except ValueError:
+    sys.exit(0)
+if ws in d.get("projects", {}):
+    del d["projects"][ws]
+    tmp = p + ".cb-tmp"
+    with open(tmp, "w") as f:
+        json.dump(d, f, indent=2)
+    os.chmod(tmp, os.stat(p).st_mode & 0o777)
+    os.replace(tmp, p)
+PY
+fi
+# Verify.
+left=""
+for x in "$b/clipbridge-shim" "$b/clipbridge-attach" "$HOME/.config/clipbridge" "$HOME/.cache/cb-spike"; do
+  [ -e "$x" ] && left="$left $x"
+done
+for n in xclip xsel pbpaste; do
+  [ -L "$b/$n" ] && [ "$(readlink "$b/$n")" = clipbridge-shim ] && left="$left $b/$n"
+done
+for f in "$HOME/.zshrc" "$HOME/.bashrc"; do
+  [ -f "$f" ] && grep -q '^# clipbridge begin' "$f" && left="$left $f(block)"
+done
+grep -q 'cb-spike/ws' "$HOME/.claude.json" 2>/dev/null && left="$left ~/.claude.json(trust entry)"
+if [ -n "$left" ]; then echo "left:$left"; else echo clean; fi
+REMOTE
+)
+
+# Remove a host on the remote side. Returns non-zero if the box couldn't be reached or cleaned.
+remote_cleanup() {
+  local alias=$1 port=${2:-} out
   if [[ -n $port ]]; then
+    # Stop forwarding on any live shared connection without closing your open sessions.
     "${SSH[@]}" -O cancel -R "127.0.0.1:$port:127.0.0.1:$MAC_PORT" "$alias" 2>/dev/null || true
   fi
-  "${SSH[@]}" -o ControlPath=none -o ClearAllForwardings=yes "$alias" 'cd ~/.local/bin 2>/dev/null && for n in xclip xsel pbpaste; do [ -L "$n" ] && [ "$(readlink "$n")" = clipbridge-shim ] && rm -f "$n"; done; rm -f ~/.local/bin/clipbridge-shim ~/.local/bin/clipbridge-attach; rm -rf ~/.config/clipbridge; for f in ~/.zshrc ~/.bashrc; do [ -f "$f" ] && awk "/^# clipbridge begin\$/{s=1;next} /^# clipbridge end\$/{s=0;next} !s" "$f" > "$f.cb-tmp" && cat "$f.cb-tmp" > "$f" && rm "$f.cb-tmp"; done; true' \
-    || say "warning: couldn't clean up $alias remotely"
+  out=$(print -r -- "$REMOTE_CLEANUP" | "${SSH[@]}" -T -o ControlPath=none -o ClearAllForwardings=yes "$alias" 'sh -s' 2>&1) || {
+    say "warning: couldn't reach $alias to clean it up: ${out##*$'\n'}"
+    return 1
+  }
+  if [[ $out == *clean* ]]; then
+    say "$alias: nothing of clipbridge left on the box"
+  else
+    say "warning: $alias: ${(M)${(f)out}:#left:*}"
+    return 1
+  fi
+}
+
+cmd_remove() {
+  local alias=${1:?usage: clipbridge remove <alias>}
+  local hf port="" rc=0
+  hf=$(host_file "$alias")
+  [[ -f $hf ]] && port=$(json_get "$hf" port)
+  remote_cleanup "$alias" "$port" || rc=1
   rm -f "$hf"
   if (( $(hosts_count) )); then
     write_include
@@ -293,6 +394,81 @@ cmd_remove() {
     rm -f "$INCLUDE"
   fi
   say "removed $alias"
+  return $rc
+}
+
+# ---------------------------------------------------------------- uninstall
+
+# Undo everything install and add did, on the Mac and on every set-up box.
+#   clipbridge uninstall [-y] [--keep-backups]
+cmd_uninstall() {
+  local yes=0 keep_backups=0 a
+  for a in "$@"; do
+    case $a in
+      -y | --yes) yes=1 ;;
+      --keep-backups) keep_backups=1 ;;
+      *) die "usage: clipbridge uninstall [-y] [--keep-backups]" ;;
+    esac
+  done
+  local -a hosts
+  hosts=("$HOSTS"/*.json(N:t:r))
+  print "This removes ClipBridge from this Mac${hosts:+ and from: ${(j:, :)hosts}}:"
+  print "  mac:  $APP, the login item, ~/.local/bin/clipbridge, ~/.config/clipbridge (keys),"
+  print "        the clipbridge block in ~/.ssh/config, ~/.ssh/cm (if empty), the log, app preferences"
+  (( keep_backups )) || print "        and the ~/.ssh/config.bak-clipbridge-* backups"
+  (( ${#hosts} )) && print "  boxes: the shims, clipbridge-attach, the PATH block, tmux settings it made, test leftovers"
+  if (( ! yes )); then
+    [[ -t 0 ]] || die "not a terminal; rerun with -y to confirm"
+    local reply
+    read -r "reply?Continue? [y/N] "
+    [[ $reply == [yY]* ]] || { say "nothing removed"; return 1; }
+  fi
+
+  local rc=0 h
+  for h in $hosts; do cmd_remove "$h" || rc=1; done
+
+  # The app and its login item.
+  launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
+  pkill -x ClipBridge 2>/dev/null || true
+  rm -f "$PLIST"
+  if [[ -d $APP ]]; then
+    /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -u "$APP" 2>/dev/null || true
+    rm -rf "$APP"
+  fi
+  # Privacy permissions macOS recorded for it (paste access, notifications); harmless if none.
+  tccutil reset All com.clumsyknight.clipbridge >/dev/null 2>&1 || true
+  defaults delete com.clumsyknight.clipbridge >/dev/null 2>&1 || true
+  rm -f "$HOME/Library/Preferences/com.clumsyknight.clipbridge.plist"
+  rm -f "$HOME/Library/Logs/clipbridge.log"
+  # The CLI link, only if it's ours.
+  local link=$HOME/.local/bin/clipbridge
+  [[ -L $link && $(readlink "$link") == */bin/clipbridge ]] && rm -f "$link"
+
+  # ssh config: our block, keys, the shared-connection socket folder.
+  [[ -f $SSHCONF ]] && sync_ssh_config 0
+  rm -rf "$CONF"
+  rmdir "$HOME/.ssh/cm" 2>/dev/null || [[ ! -d $HOME/.ssh/cm ]] \
+    || say "kept ~/.ssh/cm: an ssh connection is still open (it goes away within 10 minutes of your last session)"
+  (( keep_backups )) || rm -f "$SSHCONF".bak-clipbridge-*(N)
+
+  # Verify.
+  local -a left
+  for a in "$APP" "$PLIST" "$CONF" "$link" "$HOME/Library/Logs/clipbridge.log"; do
+    [[ -e $a || -L $a ]] && left+=("$a")
+  done
+  [[ -f $SSHCONF ]] && grep -q '^# clipbridge begin' "$SSHCONF" && left+=("$SSHCONF (block)")
+  launchctl print "gui/$(id -u)/$LABEL" >/dev/null 2>&1 && left+=("login item $LABEL")
+  pgrep -qx ClipBridge && left+=("running ClipBridge process")
+  if (( ${#left} )); then
+    say "left behind on this Mac: ${(j:, :)left}"
+    rc=1
+  else
+    say "uninstalled from this Mac"
+  fi
+  if [[ -d $ROOT/ClipBridge.app ]]; then
+    say "the release folder you installed from is still at $ROOT; delete it if you don't need it"
+  fi
+  return $rc
 }
 
 # ---------------------------------------------------------------- rotate
@@ -319,7 +495,8 @@ for path in sys.argv[1:]:
 ' "${files[@]}")
   write_include
   sync_ssh_config 1
-  local names=(${files[@]:t:r})
+  local names=(${files[@]:t:r}) n
+  for n in $names; do retire_master "$n"; done
   say "rotated ${(j:, :)names}; reconnect open sessions to use the clipboard"
 }
 
@@ -449,6 +626,7 @@ case ${1:-} in
   add) shift; cmd_add "$@" ;;
   remove) shift; cmd_remove "$@" ;;
   rotate) shift; cmd_rotate "$@" ;;
+  uninstall) shift; cmd_uninstall "$@" ;;
   doctor) shift; cmd_doctor "$@" ;;
   pause) cmd_pause ;;
   resume) cmd_resume ;;

@@ -1,3 +1,5 @@
+<img src="docs/icon.png" width="96" align="right" alt="ClipBridge icon">
+
 # clipbridge
 
 [![CI](https://github.com/Clumsynite/clipbridge/actions/workflows/ci.yml/badge.svg)](https://github.com/Clumsynite/clipbridge/actions/workflows/ci.yml)
@@ -35,9 +37,8 @@ Mac: ClipBridge.app (menu bar)                         remote (Ubuntu)
 
 **From a release** (no Xcode needed):
 
-1. Download `ClipBridge-<version>.zip` from the [latest release](../../releases/latest). The repository
-   is private, so you need access to it, or use
-   `gh release download -R Clumsynite/clipbridge -p 'ClipBridge-*.zip'`.
+1. Download `ClipBridge-<version>.zip` from the [latest release](../../releases/latest), or with the
+   GitHub CLI: `gh release download -R Clumsynite/clipbridge -p 'ClipBridge-*.zip'`.
 2. Unzip it somewhere permanent. The CLI keeps running from there, e.g.:
    ```sh
    mkdir -p ~/.local/share/clipbridge && ditto -x -k ClipBridge-*.zip ~/.local/share/clipbridge
@@ -92,6 +93,7 @@ clipbridge rotate <alias>|--all # new session keys (also happens every time Clip
 clipbridge pause | resume       # stop / start serving (same as the menu item)
 clipbridge status
 clipbridge remove <ssh-alias>   # undoes add, locally and on the remote
+clipbridge uninstall            # removes everything install and add did, on the Mac and every box (asks first; -y to skip)
 ```
 
 ## What works

@@ -51,10 +51,12 @@ enum Dialog {
         NSApp.activate(ignoringOtherApps: true)
     }
 
-    /// Alerts default to the app icon; ClipBridge has none, so use the menu-bar symbol instead.
+    /// Alerts show the app icon (Resources/AppIcon.icns in the bundle). A bare `swift run` binary has
+    /// no bundle icon, so fall back to the menu-bar symbol there instead of a generic folder.
     static func alert() -> NSAlert {
         let a = NSAlert()
-        if let img = NSImage(systemSymbolName: "doc.on.clipboard", accessibilityDescription: "ClipBridge")?
+        if Bundle.main.url(forResource: "AppIcon", withExtension: "icns") == nil,
+           let img = NSImage(systemSymbolName: "doc.on.clipboard", accessibilityDescription: "ClipBridge")?
             .withSymbolConfiguration(.init(pointSize: 40, weight: .regular)) {
             a.icon = img
         }
