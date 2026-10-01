@@ -163,7 +163,7 @@ them pastes.
 
 ## Shared accounts and tmux
 
-Several people often log in to the same account on a box, as with `devbox` here. clipbridge is
+Several people often log in to the same account on a box (a shared `deploy` or `ubuntu` user, say). clipbridge is
 **session-based** so they don't get your clipboard:
 
 | Shell | Has the key? | `pbpaste` / Ctrl+V gets |
