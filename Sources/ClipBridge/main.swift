@@ -433,6 +433,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
         var args = ["new", m.name, "--host", m.host, "--user", m.user, "--port", String(m.port),
                     "--accept-hostkey", fingerprint, "--password-stdin"]
         if installPython { args.append("--install-python") }
+        args += ["--save-to", m.saveToSSHConfig ? "ssh-config" : "clipbridge"]
         busy = "Setting up \(m.name)"
         CLI.run(args, input: m.password) { r in
             DispatchQueue.main.async {

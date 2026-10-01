@@ -5,7 +5,9 @@
 #   clipbridge add <alias> [--also <ip>]...   set up an ssh host (forward, remote shims, PATH);
 #                                 --also: other names/IPs you ssh to for the same box
 #   clipbridge new <name> --host <ip> --user <u> [--port N] [--password-stdin] [--install-python]
-#                                 add a machine that isn't in ~/.ssh/config (installs a dedicated key)
+#                  [--save-to clipbridge|ssh-config]
+#                                 add a machine that isn't in ~/.ssh/config (installs a login key);
+#                                 ssh-config: keep its Host entry and key as yours after uninstall
 #   clipbridge hostkey <host> [--port N]   show a machine's host key fingerprints
 #   clipbridge remove <alias>     undo add
 #   clipbridge uninstall [-y]     remove everything install and add did (Mac and boxes)
@@ -115,7 +117,7 @@ home = os.path.expanduser("~")
 for path in sorted(glob.glob(os.path.join(hosts_dir, "*.json"))):
     h = json.load(open(path))
     c = h.get("connection")
-    if c:
+    if c and c.get("owner", "clipbridge") == "clipbridge":
         # A machine added with `clipbridge new`: how to reach it (only under its own name).
         parts.append(
             "\nHost %s\n  HostName %s\n  User %s\n  Port %d\n"
@@ -340,7 +342,7 @@ cmd_hostkey() {
 cmd_new() {
   local name=${1:?usage: clipbridge new <name> --host <host> --user <user> [--port N] [...]}
   shift
-  local host="" user="" port=22 accept="" pwstdin=0 install_py=0
+  local host="" user="" port=22 accept="" pwstdin=0 install_py=0 save_to=clipbridge
   local -a also=()
   while (( $# )); do
     case $1 in
@@ -351,6 +353,7 @@ cmd_new() {
       --accept-hostkey) accept=${2:?}; shift 2 ;;
       --password-stdin) pwstdin=1; shift ;;
       --install-python) install_py=1; shift ;;
+      --save-to) save_to=${2:?}; shift 2 ;;
       *) die "unknown option $1" ;;
     esac
   done
@@ -358,11 +361,28 @@ cmd_new() {
   [[ -n $host && $host =~ '^[A-Za-z0-9._:-]+$' ]] || die "--host is required (a hostname or IP)"
   [[ -n $user && $user =~ '^[A-Za-z0-9._-]+$' ]] || die "--user is required"
   [[ $port =~ '^[0-9]+$' ]] || die "--port must be a number"
+  [[ $save_to == clipbridge || $save_to == ssh-config ]] || die "--save-to is clipbridge or ssh-config"
   # A host file without a key is a setup that stopped half-way (e.g. at "needs python3"): continue it.
   [[ -f $(host_file "$name") && -n $(json_opt "$(host_file "$name")" token_hex) ]] && die "$name is already set up"
   local existing
   existing=$(SSHConfig_names)
-  [[ " $existing " == *" $name "* ]] && die "$name is already a Host in ~/.ssh/config; use: clipbridge add $name"
+  if [[ " $existing " == *" $name "* ]] && ! user_host_is_ours "$name"; then
+    die "$name is already a Host in ~/.ssh/config; use: clipbridge add $name"
+  fi
+
+  # Where the connection lives decides which key and known_hosts it uses:
+  #   clipbridge  → clipbridge's include, the shared clipbridge key, clipbridge's known_hosts;
+  #                 remove/uninstall take all of it back (including the key on the box).
+  #   ssh-config  → a normal Host block in your ~/.ssh/config, its own ~/.ssh/id_ed25519_<name>,
+  #                 your ~/.ssh/known_hosts; yours to keep: remove/uninstall leave it alone.
+  local key known
+  if [[ $save_to == ssh-config ]]; then
+    key=$HOME/.ssh/id_ed25519_$name
+    known=$HOME/.ssh/known_hosts
+  else
+    key=$CB_KEY
+    known=$CB_KNOWN
+  fi
 
   local password=""
   if (( pwstdin )); then IFS= read -r password || true; fi
@@ -386,40 +406,58 @@ cmd_new() {
   # known_hosts lines are keyed by how ssh names the host: [host]:port when the port isn't 22.
   local known_name=$host
   [[ $port == 22 ]] || known_name="[$host]:$port"
-  touch "$CB_KNOWN"; chmod 600 "$CB_KNOWN"
-  print -r -- "$keys" | awk -v n="$known_name" '{ $1 = n; print }' >> "$CB_KNOWN"
-  sort -u -o "$CB_KNOWN" "$CB_KNOWN"
+  touch "$known"; chmod 600 "$known"
+  # Add only lines that aren't there yet (your own known_hosts is never reordered).
+  local line
+  print -r -- "$keys" | awk -v n="$known_name" '{ $1 = n; print }' | while IFS= read -r line; do
+    grep -qxF -- "$line" "$known" || print -r -- "$line" >> "$known"
+  done
 
-  # 2. The dedicated key, made once.
-  if [[ ! -f $CB_KEY ]]; then
-    ssh-keygen -q -t ed25519 -N "" -C "clipbridge@$(scutil --get LocalHostName 2>/dev/null || hostname -s)" -f "$CB_KEY"
+  # 2. The login key, made once.
+  if [[ ! -f $key ]]; then
+    local comment="clipbridge@$(scutil --get LocalHostName 2>/dev/null || hostname -s)"
+    [[ $save_to == ssh-config ]] && comment="$name@$(scutil --get LocalHostName 2>/dev/null || hostname -s)"
+    ssh-keygen -q -t ed25519 -N "" -C "$comment" -f "$key"
   fi
 
   # 3. The host file (connection only, no forward yet) so `ssh <name>` works from here on.
   local hf
   hf=$(host_file "$name")
+  local owner=clipbridge
+  [[ $save_to == ssh-config ]] && owner=user
   (umask 077; python3 -c '
 import json, sys, time
-hf, name, host, user, port = sys.argv[1:6]
-json.dump({"host": name, "connection": {"hostname": host, "user": user, "port": int(port)},
+hf, name, host, user, port, owner = sys.argv[1:7]
+json.dump({"host": name, "connection": {"hostname": host, "user": user, "port": int(port), "owner": owner},
            "added": int(time.time())}, open(hf, "w"), indent=2)
-' "$hf" "$name" "$host" "$user" "$port")
+' "$hf" "$name" "$host" "$user" "$port" "$owner")
+  local added_user_host=0
+  if [[ $owner == user ]] && ! user_host_is_ours "$name"; then
+    write_user_host "$name" "$host" "$user" "$port" "$key"
+    added_user_host=1
+  fi
   write_include
   sync_ssh_config 1
   local cleanup_new=1
-  new_rollback() { (( cleanup_new )) && { rm -f "$hf"; write_include; (( $(hosts_count) )) || { sync_ssh_config 0; rm -f "$INCLUDE"; }; }; }
+  new_rollback() {
+    (( cleanup_new )) || return 0
+    rm -f "$hf"
+    (( added_user_host )) && remove_user_host "$name"
+    write_include
+    (( $(hosts_count) )) || { sync_ssh_config 0; rm -f "$INCLUDE"; }
+  }
   trap 'new_rollback' EXIT
 
   # 4. Log in with the key; if that doesn't work yet, install it with the password (ssh-copy-id).
   if ! "${SSH[@]}" -o ControlPath=none -o ClearAllForwardings=yes "$name" true 2>/dev/null; then
     [[ -n $password ]] || die "the key isn't on $name yet; give the password with --password-stdin"
-    with_askpass "$password" ssh-copy-id -f -i "$CB_KEY.pub" -o ControlPath=none -o ClearAllForwardings=yes \
+    with_askpass "$password" ssh-copy-id -f -i "$key.pub" -o ControlPath=none -o ClearAllForwardings=yes \
       -o PreferredAuthentications=password,keyboard-interactive -o PubkeyAuthentication=no "$name" >/dev/null 2>&1 \
       || die "ssh-copy-id failed (wrong password, or password login disabled on $name)"
     "${SSH[@]}" -o ControlPath=none -o ClearAllForwardings=yes "$name" true 2>/dev/null \
       || die "the key was copied but logging in with it still fails"
   fi
-  say "logged in to $name with the clipbridge key"
+  say "logged in to $name with ${key/#$HOME/~}"
 
   # 5. python3 for the shim.
   if ! "${SSH[@]}" -o ControlPath=none -o ClearAllForwardings=yes "$name" 'command -v python3 >/dev/null' 2>/dev/null; then
@@ -468,6 +506,49 @@ exec cat ${(q)fifo}" > "$helper"
   wait $writer 2>/dev/null
   rm -rf "$dir"
   return $rc
+}
+
+# A Host block for a `--save-to ssh-config` machine, written into your ~/.ssh/config just above
+# clipbridge's block. Marked with a comment so a failed setup can take it back; afterwards it's yours.
+USER_HOST_MARK="# Added by clipbridge new:"
+write_user_host() {
+  local name=$1 host=$2 user=$3 port=$4 key=$5 tmp
+  cp -p "$SSHCONF" "$SSHCONF.bak-clipbridge-$(date +%Y%m%d-%H%M%S)"
+  tmp=$(mktemp)
+  python3 - "$SSHCONF" "$tmp" "$USER_HOST_MARK $name ($(date +%Y-%m-%d)). It's yours: clipbridge remove/uninstall leave it." \
+    "$name" "$host" "$user" "$port" "${key/#$HOME/~}" <<'PY'
+import sys
+src, out, mark, name, host, user, port, key = sys.argv[1:9]
+s = open(src).read()
+block = (f"{mark}\nHost {name}\n  HostName {host}\n  User {user}\n  Port {port}\n"
+         f"  IdentityFile {key}\n  IdentitiesOnly yes\n\n")
+i = s.find("# clipbridge begin")
+head, tail = (s, "") if i == -1 else (s[:i], s[i:])
+if head and not head.endswith("\n"):
+    head += "\n"
+if head and not head.endswith("\n\n"):
+    head += "\n"  # a blank line between your last block and this one
+s = head + block + tail
+open(out, "w").write(s)
+PY
+  cat "$tmp" > "$SSHCONF"
+  rm -f "$tmp"
+}
+
+user_host_is_ours() { grep -qF "$USER_HOST_MARK $1 (" "$SSHCONF" 2>/dev/null; }
+
+remove_user_host() {
+  local name=$1 tmp
+  tmp=$(mktemp)
+  python3 - "$SSHCONF" "$tmp" "$USER_HOST_MARK $name (" <<'PY'
+import re, sys
+src, out, mark = sys.argv[1:4]
+s = open(src).read()
+s = re.sub(r"(?m)^" + re.escape(mark) + r".*\n(?:(?!\n).*\n)*?\n", "", s, count=1)
+open(out, "w").write(s)
+PY
+  cat "$tmp" > "$SSHCONF"
+  rm -f "$tmp"
 }
 
 # Host aliases already in ~/.ssh/config (outside clipbridge's block).
@@ -581,7 +662,9 @@ cmd_remove() {
   local pub="" py_note=""
   [[ -f $hf ]] && port=$(json_opt "$hf" port)
   [[ -f $hf && -n $(json_opt "$hf" installed_python3) ]] && py_note=1
-  [[ -f $hf && -n $(json_opt "$hf" connection) && -f $CB_KEY.pub ]] && pub=$(<"$CB_KEY.pub")
+  if [[ -f $hf && -f $CB_KEY.pub ]] && python3 -c 'import json,sys; c=json.load(open(sys.argv[1])).get("connection"); sys.exit(0 if c and c.get("owner","clipbridge")=="clipbridge" else 1)' "$hf"; then
+    pub=$(<"$CB_KEY.pub")
+  fi
   remote_cleanup "$alias" "$port" "$pub" || rc=1
   rm -f "$hf"
   if (( $(hosts_count) )); then
@@ -592,7 +675,7 @@ cmd_remove() {
     rm -f "$INCLUDE"
   fi
   # The dedicated key and its known_hosts go with the last machine that used them.
-  if [[ -z $(grep -l '"connection"' "$HOSTS"/*.json(N) 2>/dev/null) ]]; then
+  if ! python3 -c 'import glob,json,sys,os; sys.exit(0 if any((json.load(open(f)).get("connection") or {}).get("owner","clipbridge")=="clipbridge" and json.load(open(f)).get("connection") for f in glob.glob(os.path.join(sys.argv[1],"*.json"))) else 1)' "$HOSTS"; then
     rm -f "$CB_KEY" "$CB_KEY.pub" "$CB_KNOWN"
   fi
   say "removed $alias"

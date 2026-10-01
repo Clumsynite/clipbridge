@@ -147,7 +147,16 @@ From the menu: **Add host…** → pick the alias from your `~/.ssh/config` → 
    equivalent). The password goes to `sudo -S` on stdin.
 4. **The usual setup** (forward, shims, PATH, session key), as for any host.
 
-The connection itself lives in clipbridge's generated ssh config:
+**Where the connection is saved** is your choice in the dialog (`--save-to` on the CLI):
+
+| | Only for clipbridge (default) | In my `~/.ssh/config` |
+|---|---|---|
+| Host entry | clipbridge's generated config | a normal block in `~/.ssh/config`, marked "Added by clipbridge new" |
+| Login key | shared `~/.ssh/clipbridge_ed25519` | its own `~/.ssh/id_ed25519_<name>` |
+| known_hosts | `~/.config/clipbridge/known_hosts` | your `~/.ssh/known_hosts` |
+| On `remove` / `uninstall` | all removed, including the key's line on the box | left in place: only clipbridge's forward, shims, PATH block and session key go |
+
+With "Only for clipbridge", the connection lives in clipbridge's generated ssh config:
 
 ```
 Host devbox

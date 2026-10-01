@@ -85,7 +85,8 @@ unmatched address or was opened before setup.
 **A machine that isn't in `~/.ssh/config`:** **Add host… → New machine…**, or:
 
 ```sh
-clipbridge new devbox --host 192.168.1.40 --user ubuntu [--port 22] --password-stdin [--install-python]
+clipbridge new devbox --host 192.168.1.40 --user ubuntu [--port 22] --password-stdin [--install-python] \
+  [--save-to clipbridge|ssh-config]
 ```
 
 It works like this:
@@ -93,9 +94,13 @@ It works like this:
 2. It makes a dedicated key (`~/.ssh/clipbridge_ed25519`) and installs it with your password, used once
    via `ssh-copy-id` and never saved.
 3. If the box has no python3, it offers to install it with sudo.
-4. It sets the box up as `devbox`. The connection details live in clipbridge's own ssh config, so
-   `remove`/`uninstall` take everything away again, including the key line in the box's
-   `authorized_keys`.
+4. It sets the box up as `devbox`. **You choose where the connection is saved:**
+   - **Only for clipbridge** (the default): it lives in clipbridge's own ssh config with the shared
+     clipbridge key. `remove`/`uninstall` take everything away again, including the key line in the
+     box's `authorized_keys`.
+   - **In my `~/.ssh/config`**: a normal Host entry with its own key, `~/.ssh/id_ed25519_<name>`, and
+     your `known_hosts`. It's yours: `remove`/`uninstall` take back only clipbridge's parts, and
+     `ssh devbox` keeps working.
 
 <p align="center"><img src="docs/new-machine.png" width="340" alt="Add a new machine dialog"></p>
 

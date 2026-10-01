@@ -150,6 +150,8 @@ enum Dialog {
         let user: String
         let port: Int
         let password: String
+        /// true: a normal Host entry + its own key in your ~/.ssh/config, kept after uninstall.
+        var saveToSSHConfig = false
     }
 
     /// Details for a machine that isn't in ~/.ssh/config yet.
@@ -162,7 +164,7 @@ enum Dialog {
             password (once, through ssh-copy-id), and sets the box up. The password is only used for that \
             and, if the box has no python3, for sudo to install it. It's never saved.
 
-            Leave the password empty if the clipbridge key is already on the box.
+            Leave the password empty if the login key is already on the box.
             """
         func field(_ placeholder: String, _ value: String?, secure: Bool = false) -> NSTextField {
             let f: NSTextField = secure ? NSSecureTextField(frame: .zero) : NSTextField(frame: .zero)
@@ -177,18 +179,29 @@ enum Dialog {
         let port = field("22", prefill.map { String($0.port) })
         let password = field("optional", nil, secure: true)
         // Labels beside the fields: placeholders vanish once a field is filled in.
-        let rows: [(String, NSTextField)] = [("Name", name), ("Host or IP", host), ("User", user),
-                                             ("Port", port), ("Password", password)]
+        let rows: [(String, NSView)] = [("Name", name), ("Host or IP", host), ("User", user),
+                                        ("Port", port), ("Password", password)]
+        // Where the connection is saved.
+        let onlyCB = NSButton(radioButtonWithTitle: "Only for clipbridge (removed with it)", target: nil, action: nil)
+        let mine = NSButton(radioButtonWithTitle: "In my ~/.ssh/config (mine to keep)", target: nil, action: nil)
+        onlyCB.toolTip = "Uses clipbridge's own key and known_hosts. remove/uninstall take everything back off your Mac and the box, including the key."
+        mine.toolTip = "Writes a normal Host entry and its own key (~/.ssh/id_ed25519_<name>). `ssh <name>` keeps working after you uninstall clipbridge."
+        (prefill?.saveToSSHConfig ?? false ? mine : onlyCB).state = .on
+        let choice = NSStackView(views: [onlyCB, mine])
+        choice.orientation = .vertical
+        choice.alignment = .leading
+        choice.spacing = 4
+        let radioGroup = RadioGroup([onlyCB, mine])
         let grid = NSGridView(views: rows.map { label, f in
             let l = NSTextField(labelWithString: label)
             l.alignment = .right
             return [l, f]
-        })
+        } + [[NSTextField(labelWithString: "Save"), choice]])
         grid.rowSpacing = 8
         grid.columnSpacing = 10
         grid.column(at: 0).xPlacement = .trailing
         grid.rowAlignment = .firstBaseline
-        grid.frame = NSRect(x: 0, y: 0, width: 360, height: 5 * 22 + 4 * 8)
+        grid.frame = NSRect(x: 0, y: 0, width: 360, height: 5 * 22 + 4 * 8 + 46 + 8)
         a.accessoryView = grid
         a.addButton(withTitle: "Continue")
         a.addButton(withTitle: "Cancel")
@@ -198,7 +211,8 @@ enum Dialog {
         let m = NewMachine(name: name.stringValue.trimmingCharacters(in: .whitespaces),
                            host: host.stringValue.trimmingCharacters(in: .whitespaces),
                            user: user.stringValue.trimmingCharacters(in: .whitespaces),
-                           port: p, password: password.stringValue)
+                           port: p, password: password.stringValue,
+                           saveToSSHConfig: radioGroup.selected === mine)
         let ok = { (s: String) in !s.isEmpty && s.allSatisfy { $0.isLetter || $0.isNumber || "._-:".contains($0) } }
         guard ok(m.name), ok(m.host), ok(m.user), (1...65535).contains(m.port) else {
             return newMachine(prefill: m, error: "Fill in name, host and user (letters, digits, . _ - only).")
@@ -223,6 +237,21 @@ enum Dialog {
         guard a.runModal() == .alertFirstButtonReturn else { return nil }
         let n = names(field.stringValue)
         return n.isEmpty ? nil : n
+    }
+
+    /// Makes radio buttons that don't share an action behave as one group.
+    @MainActor final class RadioGroup: NSObject {
+        let buttons: [NSButton]
+        init(_ buttons: [NSButton]) {
+            self.buttons = buttons
+            super.init()
+            for b in buttons {
+                b.target = self
+                b.action = #selector(pick(_:))
+            }
+        }
+        @objc func pick(_ sender: NSButton) { for b in buttons { b.state = b === sender ? .on : .off } }
+        var selected: NSButton? { buttons.first { $0.state == .on } }
     }
 
     static func names(_ s: String) -> [String] {
