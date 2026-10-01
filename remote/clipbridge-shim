@@ -4,14 +4,19 @@
 Installed once as ~/.local/bin/clipbridge-shim with xclip, xsel and pbpaste symlinked to it.
 Only clipboard *reads* are served, through the ssh RemoteForward to the Mac's ClipBridge app.
 Everything else (writes, the primary selection, unknown flags), or an unreachable Mac, runs
-the real tool of the same name if there is one. Config: ~/.config/clipbridge/config.json.
+the real tool of the same name if there is one.
+
+Session-based: the key is never on disk. The Mac's ssh config sends it per session as
+LC_CLIPBRIDGE=v1:<host>:<port>:<tokenhex>. Inside tmux it's read from the tmux session's
+environment, which `clipbridge-attach` sets while you're attached. A shell without it (someone
+else logged in to the same account, cron, …) never contacts the forward: it just runs the real tool.
 """
 import hashlib
 import hmac
-import json
 import os
 import secrets
 import socket
+import subprocess
 import sys
 import time
 
@@ -29,17 +34,46 @@ class Rejected(Exception):
     """Our server answered but there's nothing to serve, or the answer failed verification."""
 
 
-def config_path():
-    return os.environ.get("CLIPBRIDGE_CONFIG") or os.path.expanduser("~/.config/clipbridge/config.json")
+ENV = "LC_CLIPBRIDGE"
+
+
+def parse_key(value):
+    """v1:<host>:<port>:<64 hex> -> (host, port, key), or None."""
+    parts = (value or "").strip().split(":")
+    if len(parts) != 4 or parts[0] != "v1" or not parts[1] or not parts[2].isdigit():
+        return None
+    try:
+        key = bytes.fromhex(parts[3])
+    except ValueError:
+        return None
+    if len(key) < 16:
+        return None
+    return parts[1], int(parts[2]), key
+
+
+def tmux_value():
+    """LC_CLIPBRIDGE from the current tmux session's environment (set by clipbridge-attach)."""
+    if not os.environ.get("TMUX"):
+        return None
+    tmux = real_tool("tmux")
+    if tmux is None:
+        return None
+    try:
+        out = subprocess.run([tmux, "show-environment", ENV], capture_output=True, timeout=2).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    line = out.decode("utf-8", "replace").strip()
+    # "-LC_CLIPBRIDGE" means explicitly unset; anything not "NAME=value" means absent.
+    if not line.startswith(ENV + "="):
+        return None
+    return line[len(ENV) + 1:]
 
 
 def load_config():
-    try:
-        with open(config_path()) as f:
-            c = json.load(f)
-        return c["host"], int(c["port"]), bytes.fromhex(c["token_hex"])
-    except (OSError, ValueError, KeyError):
+    found = parse_key(os.environ.get(ENV)) or parse_key(tmux_value())
+    if found is None:
         raise Unreachable()
+    return found
 
 
 def fetch(kind):

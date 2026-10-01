@@ -171,6 +171,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
             }
         }
 
+        // Fresh session keys every launch: sessions from before carry the old key and must reconnect.
+        CLI.run(["rotate", "--all"]) { r in
+            Log.write(r.status == 0 ? "rotated session keys at launch" : "rotate at launch failed (\(r.status))")
+            DispatchQueue.main.async { MainActor.assumeIsolated { self.refreshWarnings() } }
+        }
         refreshWarnings()
         Timer.scheduledTimer(withTimeInterval: 20, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated { self?.refreshWarnings() }
@@ -260,7 +265,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
         for w in warnings {
             let i = item(w.title, #selector(fixWarning(_:)))
             i.representedObject = w
-            if w.kind == .openedBeforeSetup { i.toolTip = "These sessions were opened before clipbridge matched this name, so they have no forward. Exit and reconnect them. pids: \(w.pids.map(String.init).joined(separator: " "))" }
+            if w.kind != .unmatchedAddress { i.toolTip = "These sessions were opened before clipbridge matched this name, so they have no forward. Exit and reconnect them. pids: \(w.pids.map(String.init).joined(separator: " "))" }
             menu.addItem(i)
         }
         if !warnings.isEmpty { menu.addItem(.separator()) }
@@ -281,6 +286,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
             }
             sub.addItem(.separator())
             for (title, sel) in [("Also match another IP or name…", #selector(addNames(_:))),
+                                 ("Rotate key now", #selector(rotateKey(_:))),
                                  ("Run doctor", #selector(runDoctor(_:))),
                                  ("Remove…", #selector(removeHost(_:)))] {
                 let i = item(title, sel)
@@ -406,9 +412,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
                                  "You're connected to \(w.host) as \(w.destination), which clipbridge doesn't match, so that session has no clipboard. clipbridge will add \(w.destination) to the host's ssh block. Reconnect the session afterwards.",
                                  ok: "Match \(w.destination)") else { return }
             add(w.host, [w.destination])
+        case .openedBeforeKeyChange:
+            Dialog.message("Reconnect these sessions",
+                           "\(w.pids.count == 1 ? "This ssh session" : "These ssh sessions") to \(w.host) (\(w.destination)) started before the session key changed (it changes every time ClipBridge starts, or when you rotate it), so pastes there are refused. Exit and ssh in again.\n\npids: \(w.pids.map(String.init).joined(separator: " "))")
         case .openedBeforeSetup:
             Dialog.message("Reconnect these sessions",
                            "\(w.pids.count == 1 ? "This ssh session" : "These ssh sessions") to \(w.host) (\(w.destination)) started before clipbridge matched that name, so they have no forward to the Mac. Exit them and ssh in again.\n\npids: \(w.pids.map(String.init).joined(separator: " "))")
+        }
+    }
+
+    @objc private func rotateKey(_ sender: NSMenuItem) {
+        guard let host = sender.representedObject as? String,
+              Dialog.confirm("Rotate \(host)'s session key?",
+                             "Open ssh sessions to \(host) keep the old key and can't paste until you reconnect them. Do this if you think someone could have read the key (for example on a shared account).",
+                             ok: "Rotate") else { return }
+        runCLI("Rotating \(host)", ["rotate", host]) { r in
+            Dialog.message(r.status == 0 ? "New key for \(host)" : "Couldn't rotate \(host)", Self.clean(r.output), monospaced: r.status != 0)
         }
     }
 

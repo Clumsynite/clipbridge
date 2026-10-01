@@ -33,9 +33,10 @@ final class SessionTests: XCTestCase {
         XCTAssertNil(SSHSession.parse("1 00:01 sshd: user@pts/0", now: now))
     }
 
-    func host(names: [String: Double], also: [String] = [], ips: [String]) throws -> HostInfo {
-        let json: [String: Any] = ["host": "devbox", "port": 23187, "token_hex": "00", "also": also,
+    func host(names: [String: Double], also: [String] = [], ips: [String], rotated: Double? = nil) throws -> HostInfo {
+        var json: [String: Any] = ["host": "devbox", "port": 23187, "token_hex": "00", "also": also,
                                    "ips": ips, "added": names.values.min() ?? 0, "names_added": names]
+        if let rotated { json["rotated"] = rotated }
         return try JSONDecoder().decode(HostInfo.self, from: JSONSerialization.data(withJSONObject: json))
     }
 
@@ -74,6 +75,21 @@ final class SessionTests: XCTestCase {
         XCTAssertEqual(w[0].kind, .openedBeforeSetup)
         XCTAssertEqual(w[0].pids, [5])
         XCTAssertEqual(h.matched, ["devbox", "192.168.1.40"])
+    }
+
+    func testOpenedBeforeKeyChangeWarning() throws {
+        let setup = now.timeIntervalSince1970 - 7200
+        let rotated = now.timeIntervalSince1970 - 300
+        let h = try host(names: ["devbox": setup], ips: [], rotated: rotated)
+        let sessions = [
+            SSHSession(pid: 8, started: now.addingTimeInterval(-3600), destination: "devbox"),  // old key
+            SSHSession(pid: 9, started: now.addingTimeInterval(-60), destination: "devbox"),    // new key
+        ]
+        let w = HostWarning.compute(hosts: [h], sessions: sessions)
+        XCTAssertEqual(w.count, 1)
+        XCTAssertEqual(w[0].kind, .openedBeforeKeyChange)
+        XCTAssertEqual(w[0].pids, [8])
+        XCTAssertTrue(w[0].title.contains("before the key changed"))
     }
 
     func testAliasesFromSSHConfig() {

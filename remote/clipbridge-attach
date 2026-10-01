@@ -1,0 +1,52 @@
+#!/bin/sh
+# clipbridge-attach: tmux attach, with your Mac clipboard available inside tmux while you're attached.
+#
+#   clipbridge-attach                 attach the most recent session (like `tmux attach`)
+#   clipbridge-attach -t <session>    attach a specific session
+#
+# Shells inside tmux don't see your ssh session's LC_CLIPBRIDGE key. This copies it into the tmux
+# session's environment, where xclip/xsel/pbpaste look for it, and clears it again when you detach,
+# so nobody who attaches later gets your clipboard. Anyone attached at the same time as you can paste
+# too: they share the session.
+set -u
+
+command -v tmux >/dev/null 2>&1 || { echo "clipbridge-attach: tmux not found" >&2; exit 1; }
+
+target=""
+prev=""
+for a in "$@"; do
+  [ "$prev" = "-t" ] && target=$a
+  prev=$a
+done
+if [ -z "$target" ]; then
+  # tmux attach's default: the most recently used session.
+  target=$(tmux list-sessions -F '#{session_last_attached} #{session_name}' 2>/dev/null | sort -rn | awk 'NR==1 {print $2}')
+fi
+[ -n "$target" ] || exec tmux attach "$@"
+
+if [ -z "${LC_CLIPBRIDGE:-}" ]; then
+  echo "clipbridge-attach: this ssh session has no clipboard key (not connected via a clipbridge host?); attaching without it" >&2
+  exec tmux attach "$@"
+fi
+
+clear_key() { tmux set-environment -t "$target" -u LC_CLIPBRIDGE 2>/dev/null; }
+trap 'clear_key' EXIT
+trap 'clear_key; exit 129' HUP
+trap 'clear_key; exit 130' INT
+trap 'clear_key; exit 143' TERM
+
+# Hand the key over through tmux's update-environment (the attaching client sends it to the server)
+# rather than `set-environment NAME VALUE`, which would put it in a command line other users can see.
+# A later client without the key makes tmux mark it unset, so it doesn't outlive you either way.
+# A session-level list replaces the global one, so start from the effective list (session's own if
+# set, else global) and add ours.
+if ! tmux show-options -t "$target" update-environment 2>/dev/null | grep -q 'LC_CLIPBRIDGE'; then
+  list=$(tmux show-options -t "$target" -v update-environment 2>/dev/null)
+  [ -n "$list" ] || list=$(tmux show-options -g -v update-environment 2>/dev/null)
+  tmux set-option -t "$target" update-environment "$(echo $list) LC_CLIPBRIDGE" || exit 1
+fi
+if [ $# -eq 0 ]; then
+  tmux attach -t "$target"
+else
+  tmux attach "$@"
+fi

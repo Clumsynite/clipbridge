@@ -9,6 +9,8 @@ public struct HostInfo: Decodable, Sendable {
     public let ips: [String]?
     public let added: Double?
     public let names_added: [String: Double]?
+    /// When the session key last changed (clipbridge rotate). Sessions opened before carry the old key.
+    public let rotated: Double?
 
     /// Names the ssh config block matches: alias, HostName, --also names.
     public var matched: [String] {
@@ -128,6 +130,8 @@ public struct HostWarning: Sendable {
         case unmatchedAddress
         /// The session started before clipbridge matched that name: it has no forward until reconnected.
         case openedBeforeSetup
+        /// The session started before the session key last changed: it carries the old key, so pulls are refused.
+        case openedBeforeKeyChange
     }
 
     public let kind: Kind
@@ -143,9 +147,16 @@ public struct HostWarning: Sendable {
                 let kind: Kind
                 if h.matched.contains(s.destination) {
                     let since = h.names_added?[s.destination] ?? h.added ?? 0
-                    guard s.started.timeIntervalSince1970 < since - 2 else { continue }
-                    kind = .openedBeforeSetup
-                    key = "pre|\(h.host)|\(s.destination)"
+                    let started = s.started.timeIntervalSince1970
+                    if started < since - 2 {
+                        kind = .openedBeforeSetup
+                        key = "pre|\(h.host)|\(s.destination)"
+                    } else if let rotated = h.rotated, started < rotated - 2 {
+                        kind = .openedBeforeKeyChange
+                        key = "key|\(h.host)|\(s.destination)"
+                    } else {
+                        continue
+                    }
                 } else if (h.ips ?? []).contains(s.destination) {
                     kind = .unmatchedAddress
                     key = "ip|\(h.host)|\(s.destination)"
@@ -169,6 +180,8 @@ public struct HostWarning: Sendable {
             return "⚠︎ \(n) to \(host) via \(destination) can't see the clipboard. Fix…"
         case .openedBeforeSetup:
             return "⚠︎ \(n) to \(host) (\(destination)) opened before setup. Reconnect \(pids.count == 1 ? "it" : "them")"
+        case .openedBeforeKeyChange:
+            return "⚠︎ \(n) to \(host) (\(destination)) opened before the key changed. Reconnect \(pids.count == 1 ? "it" : "them")"
         }
     }
 }

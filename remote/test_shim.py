@@ -10,6 +10,7 @@ import json
 import os
 import socket
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -96,8 +97,12 @@ class ShimTest(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.bin = os.path.join(self.tmp.name, "bin")
         self.realbin = os.path.join(self.tmp.name, "real")
+        self.pybin = os.path.join(self.tmp.name, "py")
         os.makedirs(self.bin)
         os.makedirs(self.realbin)
+        os.makedirs(self.pybin)
+        # Only python3 on PATH besides our dirs: the Mac's own /usr/bin/pbpaste must never be found.
+        os.symlink(sys.executable, os.path.join(self.pybin, "python3"))
         shim = os.path.join(self.bin, "clipbridge-shim")
         with open(SHIM, "rb") as src, open(shim, "wb") as dst:
             dst.write(src.read())
@@ -105,7 +110,7 @@ class ShimTest(unittest.TestCase):
         for name in ("xclip", "xsel", "pbpaste"):
             os.symlink("clipbridge-shim", os.path.join(self.bin, name))
         self.server = None
-        self.cfg = os.path.join(self.tmp.name, "config.json")
+        self.key_env = None  # value for LC_CLIPBRIDGE, or None for "not set"
 
     def tearDown(self):
         if self.server:
@@ -116,9 +121,8 @@ class ShimTest(unittest.TestCase):
         self.server = FakeServer(mode)
         self.write_cfg(self.server.port)
 
-    def write_cfg(self, port):
-        with open(self.cfg, "w") as f:
-            json.dump({"host": "selftest", "port": port, "token_hex": KEY.hex()}, f)
+    def write_cfg(self, port, key=KEY):
+        self.key_env = "v1:selftest:%d:%s" % (port, key.hex())
 
     def fake_real(self, name):
         p = os.path.join(self.realbin, name)
@@ -126,10 +130,16 @@ class ShimTest(unittest.TestCase):
             f.write("#!/bin/sh\necho REAL-%s \"$@\"\n" % name)
         os.chmod(p, 0o755)
 
-    def run_shim(self, name, *args, real=True, timeout=30):
-        path = self.bin + (os.pathsep + self.realbin if real else "") + os.pathsep + "/usr/bin:/bin"
-        env = {"PATH": path, "CLIPBRIDGE_CONFIG": self.cfg, "HOME": self.tmp.name}
-        return subprocess.run([name, *args], env=env, capture_output=True, timeout=timeout)
+    def env(self, real=True, extra=None):
+        path = self.bin + (os.pathsep + self.realbin if real else "") + os.pathsep + self.pybin
+        env = {"PATH": path, "HOME": self.tmp.name}
+        if self.key_env is not None:
+            env["LC_CLIPBRIDGE"] = self.key_env
+        env.update(extra or {})
+        return env
+
+    def run_shim(self, name, *args, real=True, timeout=30, extra=None):
+        return subprocess.run([name, *args], env=self.env(real, extra), capture_output=True, timeout=timeout)
 
     def free_port(self):
         s = socket.socket()
@@ -194,8 +204,7 @@ class ShimTest(unittest.TestCase):
 
     def test_wrong_token_rejected(self):
         self.serve()
-        with open(self.cfg, "w") as f:
-            json.dump({"host": "selftest", "port": self.server.port, "token_hex": "11" * 32}, f)
+        self.write_cfg(self.server.port, key=b"\x11" * 32)
         r = self.run_shim("pbpaste")
         self.assertEqual((r.returncode, r.stdout), (1, b""))
 
@@ -217,6 +226,62 @@ class ShimTest(unittest.TestCase):
         self.fake_real("pbpaste")
         r = self.run_shim("pbpaste")
         self.assertTrue(r.stdout.startswith(b"REAL-pbpaste"))
+
+    # --- session-based key
+
+    def test_no_session_key_never_contacts_forward(self):
+        # Someone else logged in to the same account: the forward is up, but their shell has no key.
+        self.serve()
+        self.key_env = None
+        self.fake_real("xclip")
+        for c in [("pbpaste",), ("xsel", "-b", "-o"), ("xclip", "-selection", "clipboard", "-t", "image/png", "-o")]:
+            r = self.run_shim(*c)
+            if c[0] == "xclip":
+                self.assertTrue(r.stdout.startswith(b"REAL-xclip"), c)
+            else:
+                self.assertEqual((r.returncode, r.stdout), (1, b""), c)
+        self.assertEqual(self.server.requests, [])
+
+    def test_malformed_key_passes_through(self):
+        self.serve()
+        for bad in ["", "v1:selftest", "v2:selftest:%d:%s" % (self.server.port, KEY.hex()),
+                    "v1:selftest:notaport:%s" % KEY.hex(), "v1:selftest:%d:zz" % self.server.port,
+                    "v1:selftest:%d:abcd" % self.server.port]:
+            self.key_env = bad
+            r = self.run_shim("pbpaste", real=False)
+            self.assertEqual((r.returncode, r.stdout), (1, b""), bad)
+        self.assertEqual(self.server.requests, [])
+
+    def fake_tmux(self, answer):
+        p = os.path.join(self.realbin, "tmux")
+        with open(p, "w") as f:
+            f.write("#!/bin/sh\n[ \"$1\" = show-environment ] && printf '%%s\\n' '%s'\n" % answer)
+        os.chmod(p, 0o755)
+
+    def test_tmux_session_key_served(self):
+        self.serve()
+        value = self.key_env
+        self.key_env = None
+        self.fake_tmux("LC_CLIPBRIDGE=" + value)
+        r = self.run_shim("pbpaste", extra={"TMUX": "/tmp/tmux-1/default,1,0"})
+        self.assertEqual((r.returncode, r.stdout), (0, TEXT))
+
+    def test_tmux_unset_key_passes_through(self):
+        self.serve()
+        self.key_env = None
+        self.fake_tmux("-LC_CLIPBRIDGE")
+        r = self.run_shim("pbpaste", extra={"TMUX": "/tmp/tmux-1/default,1,0"})
+        self.assertEqual((r.returncode, r.stdout), (1, b""))
+        self.assertEqual(self.server.requests, [])
+
+    def test_tmux_ignored_outside_tmux(self):
+        self.serve()
+        value = self.key_env
+        self.key_env = None
+        self.fake_tmux("LC_CLIPBRIDGE=" + value)
+        r = self.run_shim("pbpaste")
+        self.assertEqual((r.returncode, r.stdout), (1, b""))
+        self.assertEqual(self.server.requests, [])
 
     def test_hung_server_gives_up_within_deadline(self):
         self.serve("hang")
@@ -266,12 +331,10 @@ class ShimTest(unittest.TestCase):
 
     def test_token_not_in_process_args(self):
         self.serve("hang")
-        path = self.bin + os.pathsep + "/usr/bin:/bin"
-        env = {"PATH": path, "CLIPBRIDGE_CONFIG": self.cfg, "HOME": self.tmp.name}
-        p = subprocess.Popen(["pbpaste"], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        p = subprocess.Popen(["pbpaste"], env=self.env(real=False), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         try:
             time.sleep(1.0)
-            ps = subprocess.run(["ps", "-ww", "-o", "args", "-p", str(p.pid)], capture_output=True, text=True).stdout
+            ps = subprocess.run(["/bin/ps", "-ww", "-o", "args", "-p", str(p.pid)], capture_output=True, text=True).stdout
             self.assertIn("pbpaste", ps)
             self.assertNotIn(KEY.hex(), ps)
             # Request MAC and the request line also never carry the token.

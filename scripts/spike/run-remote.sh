@@ -15,6 +15,11 @@ fi
 S=cbspike-$$
 tmux kill-session -t "$S" 2>/dev/null
 tmux new-session -d -s "$S" -x 200 -y 50 -c "$B/ws" "$CMD"
+# Real mode: hand this ssh session's clipboard key to the test tmux session, the way
+# clipbridge-attach would, via stdin (never a command line).
+if [ "$MODE" = "--real" ] && [ -n "${LC_CLIPBRIDGE:-}" ]; then
+  printf 'set-environment -t %s LC_CLIPBRIDGE "%s"\n' "$S" "$LC_CLIPBRIDGE" | tmux source-file -
+fi
 pane() { tmux capture-pane -p -t "$S" 2>/dev/null; }
 finish() {
   { echo "== mode $MODE exit $1"; echo "== pane"; pane; echo "== log"; cat "$B/log" 2>/dev/null; } > "$B/result-$S.txt"

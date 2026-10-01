@@ -26,12 +26,14 @@ clipbridge doctor <ssh-alias>   # checks everything end to end (copy an image or
 ```
 
 `add` does, for that one host:
-- appends a marked `# clipbridge begin/end <alias>` block to `~/.ssh/config` (a backup is written next
-  to it first). The block adds a RemoteForward on a random per-host port, plus `ControlMaster auto`,
-  `ControlPath ~/.ssh/cm/%C`, `ControlPersist 10m` and keep-alives, so all sessions to the host share
-  one connection and one forward
+- adds one marked block to `~/.ssh/config` (a backup is written next to it first) that includes
+  `~/.config/clipbridge/ssh_config` (0600). That file has a Host block per host:
+  - a RemoteForward on a random per-host port
+  - `ControlMaster auto`, `ControlPath ~/.ssh/cm/%C`, `ControlPersist 10m` and keep-alives, so all
+    sessions to the host share one connection and one forward
+  - `SetEnv LC_CLIPBRIDGE=…`, the host's **session key**
 - copies `clipbridge-shim` to the remote `~/.local/bin`, with `xclip`, `xsel` and `pbpaste` symlinked to
-  it, and writes the remote `~/.config/clipbridge/config.json` (0600)
+  it, plus `clipbridge-attach` for tmux. **Nothing secret is stored on the remote.**
 - adds a marked block to the remote `~/.zshrc` (or `~/.bashrc`) that puts `~/.local/bin` first on PATH
 
 It refuses to run if your ssh config already sets ControlMaster/ControlPath/ControlPersist/RemoteForward,
@@ -48,9 +50,14 @@ other IPs. Each host's submenu has **Also match another IP or name…**, **Run d
 The menu also warns, and offers a fix, when one of your running ssh sessions reached a set-up box by an
 unmatched address or was opened before setup.
 
+**tmux:** a shell inside tmux doesn't inherit your ssh session's key. Attach with `clipbridge-attach`
+(same arguments as `tmux attach`, e.g. `clipbridge-attach -t claude`). The key is then available to
+every pane of that session while you're attached, and cleared when you detach.
+
 Other commands:
 
 ```sh
+clipbridge rotate <alias>|--all # new session keys (also happens every time ClipBridge starts)
 clipbridge pause | resume       # stop / start serving (same as the menu item)
 clipbridge status
 clipbridge remove <ssh-alias>   # undoes add, locally and on the remote
@@ -92,9 +99,16 @@ let g:clipboard = {'name': 'clipbridge', 'paste': {'+': 'pbpaste', '*': 'pbpaste
 ## Security model
 
 - **Mac listener:** the app listens only on `127.0.0.1:7788`. Nothing on your network can reach it.
-- **Per-host token:** each host has its own random 32-byte token, stored 0600 on both ends. Requests
-  carry an HMAC-SHA256 over the path, host, timestamp and a random nonce. The token itself never travels
-  and never appears in a process's arguments, so other users on a shared box can't read it from `ps`.
+- **Session-based key:** each host has its own random 32-byte key.
+  - **Where it lives:** on the Mac only, in 0600 files. Your ssh client hands it to each of *your*
+    sessions as the environment variable `LC_CLIPBRIDGE`. It's never written to the remote disk and
+    never appears in a command line.
+  - **Shared accounts:** if other people log in to the same account on the box, their shells don't have
+    the key. Their `pbpaste` / Ctrl+V go to the real tools and never even contact your forward.
+  - **Rotation:** the key changes every time ClipBridge starts, and on `clipbridge rotate` or the menu's
+    **Rotate key now**. Sessions opened before a rotation must reconnect, and the menu says which.
+  - **Requests:** they carry an HMAC-SHA256 over the path, host, timestamp and a random nonce. The key
+    itself never travels.
 - **Request checks:** stale timestamps (more than 60 s off), replayed nonces and bad MACs get 401.
 - **Signed responses:** the shim rejects any response not signed with the token. If another user on the
   box grabs the forward port first, they can't feed you a fake image or text, and they never see your
@@ -103,9 +117,15 @@ let g:clipboard = {'name': 'clipbridge', 'paste': {'+': 'pbpaste', '*': 'pbpaste
   Content already on the clipboard when the app starts counts as stale until you copy something.
 - **Password managers:** items they mark as concealed or transient (`org.nspasteboard.ConcealedType`,
   `TransientType`, 1Password) are **never** served. Maccy honours the same markers.
-- **What it can't stop:** while the forward is up and the window is open, any process running as *your*
-  user on the remote can read the clipboard. That includes the remote Claude Code's own Bash tool. Use
-  Pause when you copy something sensitive that isn't marked as concealed, or remove the host.
+- **What it can't stop:**
+  - **Your own sessions:** any process running *inside* one of them (including the remote Claude Code's
+    own Bash tool) can read the clipboard while the window is open.
+  - **Someone on the same account doing it deliberately:** they could read the key out of your live
+    shell's environment (`/proc/<pid>/environ`), or out of a tmux session while you're attached to it.
+  - **Root:** anyone with root (or sudo) on the box can do the same.
+
+  The key changes every time ClipBridge starts. Use Pause before copying something sensitive that isn't
+  marked as concealed, or remove the host.
 - **Log:** every pull is logged to `~/Library/Logs/clipbridge.log` (host, route, status, size; never the
   content) and shown under *Recent pulls* in the menu.
 

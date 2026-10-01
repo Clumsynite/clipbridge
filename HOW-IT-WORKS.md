@@ -65,8 +65,11 @@ sequenceDiagram
 
 1. Claude Code on Linux reads the clipboard by running `xclip`. Because `~/.local/bin` comes first on
    PATH, it runs the shim instead of `/usr/bin/xclip`.
-2. The shim reads `~/.config/clipbridge/config.json` to get the host name, the forward port and the
-   token. It sends a request signed with the token to `127.0.0.1:<port>` on the box.
+2. The shim takes the host name, forward port and **session key** from `LC_CLIPBRIDGE` in its
+   environment. Your ssh client put it there when you connected; inside tmux, it comes from the tmux
+   session that `clipbridge-attach` filled in. It then sends a request signed with the key to
+   `127.0.0.1:<port>` on the box. **No key, no request:** a shell without it just runs the real
+   `xclip`/`pbpaste`.
 3. That port is the **RemoteForward** your ssh connection opened. The request travels back over SSH to
    `127.0.0.1:7788` on the Mac.
 4. ClipBridge.app checks the signature, the timestamp and that the nonce hasn't been used before. It then
@@ -86,9 +89,15 @@ From the menu: **Add host…** → pick the alias from your `~/.ssh/config` → 
 `add` makes these changes:
 
 **On the Mac**
-- appends to `~/.ssh/config` (a backup is written next to it first):
+- adds one block to `~/.ssh/config` (a backup is written next to it first):
   ```
-  # clipbridge begin devbox
+  # clipbridge begin
+  Match all
+  Include ~/.config/clipbridge/ssh_config
+  # clipbridge end
+  ```
+  and writes the included file, `~/.config/clipbridge/ssh_config` (0600, generated; holds the keys):
+  ```
   Host devbox 100.64.0.12 192.168.1.40
     RemoteForward 127.0.0.1:23187 127.0.0.1:7788
     ControlMaster auto
@@ -96,8 +105,10 @@ From the menu: **Add host…** → pick the alias from your `~/.ssh/config` → 
     ControlPersist 10m
     ServerAliveInterval 15
     ServerAliveCountMax 3
-  # clipbridge end devbox
+    SetEnv LC_CLIPBRIDGE=v1:devbox:23187:<session key>
   ```
+  `SetEnv` is how each of your sessions gets the key: sshd puts it in that session's environment. Most
+  Linux sshd configs accept `LC_*` variables from clients (`AcceptEnv LANG LC_*`); `doctor` checks.
   The remote port (here 23187) is picked at random per host. **ControlMaster** makes every session to the
   box share one connection and so one forward. Without it, the second session would fail to bind the
   same port.
@@ -109,8 +120,9 @@ From the menu: **Add host…** → pick the alias from your `~/.ssh/config` → 
 
 **On the box**
 - `~/.local/bin/clipbridge-shim`, with `xclip`, `xsel` and `pbpaste` symlinked to it
-- `~/.config/clipbridge/config.json` (0600): host, port, token. It's sent over ssh stdin, never in a
-  command line.
+- `~/.local/bin/clipbridge-attach`, the tmux helper (below)
+- **no key**: nothing secret is written on the box (older versions kept one in
+  `~/.config/clipbridge/config.json`; `add` deletes it)
 - a marked block at the end of `~/.zshrc` (or `~/.bashrc`) that puts `~/.local/bin` first on PATH
 
 **Then open a new ssh session.** A session that was already open has no forward.
@@ -149,18 +161,41 @@ them pastes.
 
 ---
 
+## Shared accounts and tmux
+
+Several people often log in to the same account on a box, as with `devbox` here. clipbridge is
+**session-based** so they don't get your clipboard:
+
+| Shell | Has the key? | `pbpaste` / Ctrl+V gets |
+|---|---|---|
+| started by *your* ssh session | yes (`LC_CLIPBRIDGE` from your Mac) | your Mac clipboard |
+| someone else's session on the same account | no | the real tool (nothing, on a server); your forward is never contacted |
+| inside tmux, while you're attached with `clipbridge-attach` | yes (read from the tmux session) | your Mac clipboard |
+| inside tmux, after you detach | no (cleared on detach) | the real tool |
+| a session you opened before the key last changed | an old key, refused | nothing, until you reconnect (the menu warns) |
+
+**tmux:** use `clipbridge-attach` instead of `tmux attach`; it takes the same arguments. It hands your
+session's key to that tmux session through tmux's `update-environment`, never on a command line. Panes
+that already exist pick it up too, because the shim asks tmux directly. When you detach it clears the
+key, so whoever attaches next gets nothing. While you're attached, anyone else attached to the *same*
+tmux session can paste too: they're sharing your screen anyway.
+
+**Key rotation:** keys change every time ClipBridge starts, and with **Rotate key now** in the host's
+submenu or `clipbridge rotate <alias>`. Only the Mac changes; new sessions pick up the new key.
+
 ## Security
 
 | Concern | How it's handled |
 |---|---|
 | Other machines on your network | The app listens on `127.0.0.1` only. |
-| Other users on a shared box reading your clipboard | Every request needs an HMAC-SHA256 made with a per-host 32-byte token. The token lives in 0600 files and never travels or appears in a command line, so `ps` doesn't show it. |
+| Other accounts on the box | Every request needs an HMAC-SHA256 made with the host's 32-byte session key. Only your ssh sessions hold it, in their environment; it's never on the box's disk, never on a command line (so not in `ps`), and never sent over the wire. |
+| Other people on the *same* account | Their shells don't have the key, so their `pbpaste`/Ctrl+V never contact your forward. The key changes every time ClipBridge starts. |
 | Replayed or forged requests | Each request has a timestamp (±60 s) and a single-use nonce, both covered by the MAC. |
 | Someone grabbing the forward port first to feed you fake data | Every response is signed too. The shim discards anything that doesn't verify. |
 | Old clipboard contents leaking later | Only content copied in the last **2 minutes** is served (menu: 2 min / 10 min / Off). Whatever is on the clipboard when the app starts counts as stale until you copy something. |
 | Passwords | Items that password managers mark as concealed or transient (`org.nspasteboard.ConcealedType` etc.) are **never** served. |
 | Seeing who pulled what | Every pull is logged to `~/Library/Logs/clipbridge.log` (host, route, status, size; never the content) and listed under *Recent pulls*. |
-| **What it can't stop** | While the forward is up and the 2-minute window is open, any process running as *your* user on the box can read the clipboard. That includes Claude Code's own Bash tool. Use **Pause** before copying something sensitive that isn't marked as concealed. |
+| **What it can't stop** | Processes inside *your* sessions can read the clipboard while the 2-minute window is open, including Claude Code's own Bash tool. Someone on the same account who *deliberately* reads your live shell's environment (`/proc/<pid>/environ`) or your attached tmux session, or anyone with root, can get the key until it next changes. Use **Pause** before copying something sensitive that isn't marked as concealed. |
 
 ---
 
@@ -176,6 +211,7 @@ Hosts
   devbox  ▸  Matches: devbox, 100.64.0.12, 192.168.1.40
                     Not matched: 10.0.0.12, 100.64.0.13
                     Also match another IP or name…
+                    Rotate key now
                     Run doctor
                     Remove…
 Add host…
@@ -210,13 +246,16 @@ Run **Run doctor** from the host's submenu, or `clipbridge doctor <alias>`. It c
 | doctor: "nothing listening on remote 127.0.0.1:PORT" | No live connection carries the forward | Open a new ssh session; if an old one lingers: `ssh -O exit <alias>` |
 | doctor: `xclip` resolves to `/usr/bin/xclip` | `~/.local/bin` isn't first on PATH in that shell | Log in again; check the clipbridge block at the end of `~/.zshrc` |
 | doctor: clock skew > 30 s | The box's clock is off, so requests get 401 | Fix NTP on the box |
+| Works in a plain session but not inside tmux | The tmux session doesn't have your key | Attach with `clipbridge-attach -t <session>` |
+| Stopped working after restarting ClipBridge or rotating | The session still has the old key | Reconnect; the menu lists sessions "opened before the key changed" |
+| doctor: "a new session doesn't get the current key" | The box's sshd doesn't accept `LC_*` from clients | Ask the admin for `AcceptEnv LC_*` in sshd_config |
 | Works with `ssh <alias>` but not `ssh user@<ip>` | The IP isn't matched | **Also match another IP or name…**, or `clipbridge add <alias> --also <ip>` |
 | Paste stops working after a Claude Code update | A newer build may read the clipboard another way | Run `scripts/spike/run.sh <alias> --real`. It starts Claude Code in tmux, presses Ctrl+V and reports. |
 
 ## Undo
 
 **Remove…** in the host's submenu, or `clipbridge remove <alias>`. This:
-- deletes the shims, the config and the PATH block on the box
+- deletes the shims, `clipbridge-attach` and the PATH block on the box
 - deletes the block from `~/.ssh/config` (with a backup)
 - deletes the host's token file
 
