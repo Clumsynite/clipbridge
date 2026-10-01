@@ -129,6 +129,57 @@ From the menu: **Add host…** → pick the alias from your `~/.ssh/config` → 
 
 ---
 
+## Adding a machine that isn't in ~/.ssh/config
+
+**Add host… → New machine…** (or `clipbridge new <name> --host … --user …`):
+
+1. **Host key.** clipbridge fetches the box's host keys (`ssh-keyscan`) and shows their fingerprints.
+   Only after you confirm does it trust them, in its own `~/.config/clipbridge/known_hosts`. This is
+   the "Are you sure you want to continue connecting?" step, made explicit. Compare with
+   `ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub` on the box if you can.
+2. **Login key.** It creates `~/.ssh/clipbridge_ed25519` once, used only for machines added this way,
+   and installs it with `ssh-copy-id`.
+   - **The password:** if you gave one, it's handed to ssh through a one-time askpass helper that reads
+     it from a private pipe. It never touches the disk and never appears in a command line.
+   - **No password:** the key must already work.
+3. **python3.** The shim needs it. If it's missing, clipbridge asks, then runs the box's package
+   manager with `sudo` (`apt-get install python3-minimal`, or the dnf / yum / apk / zypper / pacman
+   equivalent). The password goes to `sudo -S` on stdin.
+4. **The usual setup** (forward, shims, PATH, session key), as for any host.
+
+The connection itself lives in clipbridge's generated ssh config:
+
+```
+Host devbox
+  HostName 192.168.1.40
+  User ubuntu
+  Port 22
+  IdentityFile ~/.ssh/clipbridge_ed25519
+  IdentitiesOnly yes
+  UserKnownHostsFile ~/.config/clipbridge/known_hosts
+```
+
+So `ssh devbox` works from then on. `remove devbox` (or `uninstall`) takes it all back:
+- the box's `authorized_keys` line for the clipbridge key, done last, since that's how it's logged in
+- the Host entry and its known_hosts lines
+- the key itself, once no machine uses it
+
+The one thing left on purpose is python3, if clipbridge installed it. It's a system package other
+software may start using, so `remove` tells you instead of uninstalling it.
+
+## What a box needs
+
+| Needed | Why | Ubuntu/Debian server or cloud image |
+|---|---|---|
+| `python3` (standard library only) | The shim and its HMAC checks | Included (cloud-init, netplan need it); otherwise offered as a sudo install |
+| `bash` or `zsh` | The PATH block | Included |
+| sshd accepting `LC_*` from clients | How each session gets its key | `AcceptEnv LANG LC_*` is the default |
+| Key login | `add`/`doctor` run without prompts | `clipbridge new` installs one |
+| *optional* `tmux` | `clipbridge-attach` | |
+
+**Not** needed: `xclip`, `xsel`, X11, Wayland or any clipboard tool. The shims provide those commands,
+and they fall through to real ones only for things clipbridge doesn't handle.
+
 ## Which connections get the clipboard (the IP problem)
 
 ssh applies a `Host` block only when the **name you typed** matches it. If the block says
@@ -258,6 +309,8 @@ Run **Run doctor** from the host's submenu, or `clipbridge doctor <alias>`. It c
 deletes:
 - the shims and `clipbridge-attach`
 - the PATH block in `~/.zshrc`/`~/.bashrc`, restored byte for byte
+- for machines added with **New machine…**: the clipbridge key's line in `authorized_keys`, plus
+  `~/.ssh` and `~/.local/bin` if that leaves them empty
 - the tmux settings `clipbridge-attach` made
 - any test leftovers (`~/.cache/cb-spike` and its trust entry in `~/.claude.json`)
 
@@ -271,6 +324,7 @@ host as above, then on the Mac:
 - the `~/.local/bin/clipbridge` link
 - `~/.config/clipbridge`
 - the block in `~/.ssh/config`, which leaves the file exactly as it was before clipbridge
+- the dedicated key `~/.ssh/clipbridge_ed25519` and clipbridge's `known_hosts`
 - the `~/.ssh/config.bak-clipbridge-*` backups (keep them with `--keep-backups`)
 - `~/.ssh/cm`, once no ssh connection is using it
 

@@ -82,6 +82,27 @@ other IPs. Each host's submenu has **Also match another IP or name…**, **Run d
 The menu also warns, and offers a fix, when one of your running ssh sessions reached a set-up box by an
 unmatched address or was opened before setup.
 
+**A machine that isn't in `~/.ssh/config`:** **Add host… → New machine…**, or:
+
+```sh
+clipbridge new devbox --host 192.168.1.40 --user ubuntu [--port 22] --password-stdin [--install-python]
+```
+
+It works like this:
+1. It shows the box's host key fingerprint for you to confirm.
+2. It makes a dedicated key (`~/.ssh/clipbridge_ed25519`) and installs it with your password, used once
+   via `ssh-copy-id` and never saved.
+3. If the box has no python3, it offers to install it with sudo.
+4. It sets the box up as `devbox`. The connection details live in clipbridge's own ssh config, so
+   `remove`/`uninstall` take everything away again, including the key line in the box's
+   `authorized_keys`.
+
+<p align="center"><img src="docs/new-machine.png" width="340" alt="Add a new machine dialog"></p>
+
+**What a box needs:** Linux with `python3` (stdlib only), `bash` or `zsh`, and sshd accepting `LC_*`
+from clients. Ubuntu/Debian server and cloud images have all three. No `xclip`, X11 or clipboard tools
+are needed: the shims *are* the clipboard. `tmux` is optional.
+
 **tmux:** a shell inside tmux doesn't inherit your ssh session's key. Attach with `clipbridge-attach`
 (same arguments as `tmux attach`, e.g. `clipbridge-attach -t claude`). The key is then available to
 every pane of that session while you're attached, and cleared when you detach.

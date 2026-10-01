@@ -14,7 +14,7 @@ enum CLI {
         let output: String
     }
 
-    static func run(_ args: [String], completion: @escaping @Sendable (Result) -> Void) {
+    static func run(_ args: [String], input: String? = nil, completion: @escaping @Sendable (Result) -> Void) {
         guard let path else {
             completion(Result(status: 127, output: "clipbridge CLI not found at ~/.local/bin/clipbridge. Run bin/clipbridge install from the repo."))
             return
@@ -30,12 +30,17 @@ enum CLI {
             let pipe = Pipe()
             p.standardOutput = pipe
             p.standardError = pipe
-            p.standardInput = FileHandle.nullDevice
+            let stdin = input.map { _ in Pipe() }
+            p.standardInput = stdin ?? FileHandle.nullDevice
             do {
                 try p.run()
             } catch {
                 completion(Result(status: 126, output: "couldn't run clipbridge: \(error.localizedDescription)"))
                 return
+            }
+            if let stdin, let input {
+                stdin.fileHandleForWriting.write(Data((input + "\n").utf8))
+                try? stdin.fileHandleForWriting.close()
             }
             let data = pipe.fileHandleForReading.readDataToEndOfFile()
             p.waitUntilExit()
@@ -94,8 +99,14 @@ enum Dialog {
         return a.runModal() == .alertFirstButtonReturn
     }
 
-    /// Returns (alias, extra names) or nil if cancelled.
-    static func addHost(aliases: [String]) -> (String, [String])? {
+    enum AddChoice {
+        case existing(String, [String])
+        case newMachine
+    }
+
+    /// Pick an ssh alias (plus extra names), or ask for a machine that isn't in ~/.ssh/config.
+    static func addHost(aliases: [String]) -> AddChoice? {
+        if aliases.isEmpty { return .newMachine }
         activate()
         let a = alert()
         a.messageText = "Add a host"
@@ -120,9 +131,79 @@ enum Dialog {
         a.accessoryView = stack
         a.addButton(withTitle: "Add")
         a.addButton(withTitle: "Cancel")
+        a.addButton(withTitle: "New machine…")
         a.window.initialFirstResponder = popup
-        guard a.runModal() == .alertFirstButtonReturn, let alias = popup.titleOfSelectedItem else { return nil }
-        return (alias, names(field.stringValue))
+        switch a.runModal() {
+        case .alertFirstButtonReturn:
+            guard let alias = popup.titleOfSelectedItem else { return nil }
+            return .existing(alias, names(field.stringValue))
+        case .alertThirdButtonReturn:
+            return .newMachine
+        default:
+            return nil
+        }
+    }
+
+    struct NewMachine {
+        let name: String
+        let host: String
+        let user: String
+        let port: Int
+        let password: String
+    }
+
+    /// Details for a machine that isn't in ~/.ssh/config yet.
+    static func newMachine(prefill: NewMachine? = nil, error: String? = nil) -> NewMachine? {
+        activate()
+        let a = alert()
+        a.messageText = "Add a new machine"
+        a.informativeText = (error.map { "⚠︎ \($0)\n\n" } ?? "") + """
+            For a box that isn't in ~/.ssh/config. clipbridge makes a dedicated key, installs it with your \
+            password (once, through ssh-copy-id), and sets the box up. The password is only used for that \
+            and, if the box has no python3, for sudo to install it. It's never saved.
+
+            Leave the password empty if the clipbridge key is already on the box.
+            """
+        func field(_ placeholder: String, _ value: String?, secure: Bool = false) -> NSTextField {
+            let f: NSTextField = secure ? NSSecureTextField(frame: .zero) : NSTextField(frame: .zero)
+            f.placeholderString = placeholder
+            f.stringValue = value ?? ""
+            f.widthAnchor.constraint(equalToConstant: 270).isActive = true
+            return f
+        }
+        let name = field("e.g. devbox (you'll ssh to it as this)", prefill?.name)
+        let host = field("e.g. 192.168.1.40", prefill?.host)
+        let user = field("e.g. ubuntu", prefill?.user)
+        let port = field("22", prefill.map { String($0.port) })
+        let password = field("optional", nil, secure: true)
+        // Labels beside the fields: placeholders vanish once a field is filled in.
+        let rows: [(String, NSTextField)] = [("Name", name), ("Host or IP", host), ("User", user),
+                                             ("Port", port), ("Password", password)]
+        let grid = NSGridView(views: rows.map { label, f in
+            let l = NSTextField(labelWithString: label)
+            l.alignment = .right
+            return [l, f]
+        })
+        grid.rowSpacing = 8
+        grid.columnSpacing = 10
+        grid.column(at: 0).xPlacement = .trailing
+        grid.rowAlignment = .firstBaseline
+        grid.frame = NSRect(x: 0, y: 0, width: 360, height: 5 * 22 + 4 * 8)
+        a.accessoryView = grid
+        a.addButton(withTitle: "Continue")
+        a.addButton(withTitle: "Cancel")
+        a.window.initialFirstResponder = name
+        guard a.runModal() == .alertFirstButtonReturn else { return nil }
+        let p = Int(port.stringValue.trimmingCharacters(in: .whitespaces)) ?? 22
+        let m = NewMachine(name: name.stringValue.trimmingCharacters(in: .whitespaces),
+                           host: host.stringValue.trimmingCharacters(in: .whitespaces),
+                           user: user.stringValue.trimmingCharacters(in: .whitespaces),
+                           port: p, password: password.stringValue)
+        let ok = { (s: String) in !s.isEmpty && s.allSatisfy { $0.isLetter || $0.isNumber || "._-:".contains($0) } }
+        guard ok(m.name), ok(m.host), ok(m.user), (1...65535).contains(m.port) else {
+            return newMachine(prefill: m, error: "Fill in name, host and user (letters, digits, . _ - only).")
+        }
+        return m
     }
 
     /// Asks for extra names/IPs for an existing host.

@@ -165,6 +165,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
                     menu.popUp(positioning: nil, at: NSPoint(x: 200, y: 1000), in: nil)
                 }
             }
+            if CommandLine.arguments.contains("--new-machine-dialog") {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1) {
+                    _ = Dialog.newMachine(prefill: .init(name: "devbox", host: "192.168.1.40", user: "ubuntu", port: 22, password: ""))
+                }
+            }
             if CommandLine.arguments.contains("--add-host-dialog") {
                 DispatchQueue.main.asyncAfter(deadline: .now() + 1) { _ = Dialog.addHost(aliases: Demo.aliases) }
             }
@@ -396,12 +401,60 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
     @objc private func addHost() {
         let existing = Set(currentHosts().map(\.host))
         let aliases = SSHConfig.aliases(in: (try? String(contentsOf: Paths.home.appendingPathComponent(".ssh/config"), encoding: .utf8)) ?? "").filter { !existing.contains($0) }
-        guard !aliases.isEmpty else {
-            Dialog.message("No ssh aliases to add", "Every Host in ~/.ssh/config is already set up, or there are none. Add a Host entry for the box first.")
-            return
+        switch Dialog.addHost(aliases: aliases) {
+        case .existing(let alias, let extra)?: add(alias, extra)
+        case .newMachine?: addNewMachine()
+        case nil: return
         }
-        guard let (alias, extra) = Dialog.addHost(aliases: aliases) else { return }
-        add(alias, extra)
+    }
+
+    /// A machine that isn't in ~/.ssh/config: details → confirm its host key → `clipbridge new`.
+    private func addNewMachine(_ prefill: Dialog.NewMachine? = nil) {
+        guard let m = Dialog.newMachine(prefill: prefill) else { return }
+        runCLI("Checking \(m.host)", ["hostkey", m.host, "--port", String(m.port)]) { r in
+            guard r.status == 0 else {
+                Dialog.message("Can't reach \(m.host):\(m.port)", Self.clean(r.output))
+                return
+            }
+            let lines = r.output.split(separator: "\n").map(String.init).filter { $0.hasPrefix("SHA256:") }
+            guard let pick = lines.first(where: { $0.contains("ED25519") }) ?? lines.first,
+                  let fp = pick.split(separator: " ").first.map(String.init) else {
+                Dialog.message("No host key from \(m.host)", Self.clean(r.output))
+                return
+            }
+            guard Dialog.confirm("Trust \(m.host)?",
+                                 "Its host key fingerprints:\n\n\(lines.joined(separator: "\n"))\n\nTo be sure it's the right machine, compare with what the box itself shows: ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub",
+                                 ok: "Trust") else { return }
+            self.runNew(m, fingerprint: fp, installPython: false)
+        }
+    }
+
+    private func runNew(_ m: Dialog.NewMachine, fingerprint: String, installPython: Bool) {
+        var args = ["new", m.name, "--host", m.host, "--user", m.user, "--port", String(m.port),
+                    "--accept-hostkey", fingerprint, "--password-stdin"]
+        if installPython { args.append("--install-python") }
+        busy = "Setting up \(m.name)"
+        CLI.run(args, input: m.password) { r in
+            DispatchQueue.main.async {
+                MainActor.assumeIsolated {
+                    self.busy = nil
+                    self.refreshWarnings()
+                    if r.status == 4 {
+                        if Dialog.confirm("\(m.name) has no python3",
+                                          "clipbridge's shim needs python3. Install it now with sudo (using the password you entered)? It runs the box's package manager, e.g. apt-get install python3-minimal.",
+                                          ok: "Install python3") {
+                            self.runNew(m, fingerprint: fingerprint, installPython: true)
+                        }
+                        return
+                    }
+                    guard r.status == 0 else {
+                        Dialog.message("Couldn't set up \(m.name)", Self.clean(r.output), monospaced: true)
+                        return
+                    }
+                    self.finishAdd(m.name, r)
+                }
+            }
+        }
     }
 
     private func add(_ alias: String, _ extra: [String]) {
@@ -410,6 +463,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
                 Dialog.message("Couldn't set up \(alias)", Self.clean(r.output), monospaced: true)
                 return
             }
+            self.finishAdd(alias, r)
+        }
+    }
+
+    private func finishAdd(_ alias: String, _ r: CLI.Result) {
+        do {
             let others = r.output.split(separator: "\n").first { $0.hasPrefix("other-ips:") }
                 .map { $0.dropFirst("other-ips:".count).split(separator: " ").map(String.init) } ?? []
             if !others.isEmpty,
