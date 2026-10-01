@@ -19,7 +19,7 @@ On the Mac (needs Xcode / Swift 6):
 
 ```sh
 bin/clipbridge install          # builds ~/Applications/ClipBridge.app, starts it at login, links the CLI
-clipbridge add <ssh-alias>      # sets up one host
+clipbridge add <ssh-alias> [--also <ip>]...   # sets up one host; --also adds other IPs/names you ssh to for it
 clipbridge doctor <ssh-alias>   # checks everything end to end (copy an image or text first)
 ```
 
@@ -34,6 +34,10 @@ clipbridge doctor <ssh-alias>   # checks everything end to end (copy an image or
 
 It refuses to run if your ssh config already sets ControlMaster/ControlPath/ControlPersist/RemoteForward,
 or if the remote `~/.local/bin` already has an `xclip`, `xsel` or `pbpaste` that isn't ours.
+
+The block matches the alias, its `HostName`, and any `--also` names. If you sometimes connect by a
+different IP (LAN vs Tailscale, say), add it with `--also` or that connection won't get the forward.
+The names are remembered, so running `add` again keeps them.
 
 Open a **new** ssh session after `add`. A connection opened before it has no forward.
 

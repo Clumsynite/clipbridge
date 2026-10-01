@@ -2,7 +2,8 @@
 # clipbridge: make the Mac clipboard readable from SSH sessions.
 #
 #   clipbridge install            build ClipBridge.app, start it at login, link this CLI
-#   clipbridge add <alias>        set up an ssh host (forward, remote shims, PATH)
+#   clipbridge add <alias> [--also <ip>]...   set up an ssh host (forward, remote shims, PATH);
+#                                 --also: other names/IPs you ssh to for the same box
 #   clipbridge remove <alias>     undo add
 #   clipbridge doctor [alias]     check everything end to end
 #   clipbridge pause | resume     stop / start serving the clipboard
@@ -82,14 +83,20 @@ foreign_settings() {
 }
 
 write_block() {
-  local alias=$1 port=$2 tmp
+  local alias=$1 port=$2 extra=${3:-} tmp names=$1 hn n
+  # Also match the real HostName and any extra names (other IPs of the same box), so
+  # `ssh user@<ip>` gets the forward too, not just `ssh <alias>`.
+  hn=$(ssh -G "$alias" 2>/dev/null | awk '$1 == "hostname" { print $2 }')
+  for n in $hn ${=extra}; do
+    [[ " $names " == *" $n "* ]] || names+=" $n"
+  done
   tmp=$(mktemp)
   strip_block "$alias" "$SSHCONF" > "$tmp"
   # Keep a blank line between the last block and ours.
   [[ -s $tmp && -n $(tail -c1 "$tmp") ]] && print >> "$tmp"
   cat >> "$tmp" <<EOF
 $(block_begin "$alias")
-Host $alias
+Host $names
   RemoteForward 127.0.0.1:$port 127.0.0.1:$MAC_PORT
   ControlMaster auto
   ControlPath ~/.ssh/cm/%C
@@ -115,7 +122,17 @@ rc_file_for() {
 # ---------------------------------------------------------------- add
 
 cmd_add() {
-  local alias=${1:?usage: clipbridge add <alias>}
+  local alias=${1:?usage: clipbridge add <alias> [--also <host-or-ip>]...}
+  shift
+  local -a also=()
+  while (( $# )); do
+    case $1 in
+      --also) [[ -n ${2:-} ]] || die "--also needs a host or IP"; also+=("$2"); shift 2 ;;
+      *) die "unknown option $1" ;;
+    esac
+  done
+  local n
+  for n in $also; do [[ $n =~ '^[A-Za-z0-9._:-]+$' ]] || die "bad --also name: $n"; done
   [[ $alias =~ '^[A-Za-z0-9._-]+$' ]] || die "alias must be letters, digits, . _ -"
   [[ -f $SSHCONF ]] || die "no $SSHCONF"
   local foreign
@@ -125,7 +142,7 @@ $foreign"
 
   say "checking $alias"
   local info
-  info=$("${SSH[@]}" -o ControlPath=none "$alias" 'printf "shell=%s\n" "$SHELL"; command -v python3 >/dev/null && echo python3=yes; for n in clipbridge-shim xclip xsel pbpaste; do f="$HOME/.local/bin/$n"; if [ -L "$f" ]; then echo "link $n $(readlink "$f")"; elif [ -e "$f" ]; then echo "file $n"; fi; done; ss -ltn 2>/dev/null | awk "NR>1{print \"port \" \$4}"') \
+  info=$("${SSH[@]}" -o ControlPath=none -o ClearAllForwardings=yes "$alias" 'printf "shell=%s\n" "$SHELL"; command -v python3 >/dev/null && echo python3=yes; for n in clipbridge-shim xclip xsel pbpaste; do f="$HOME/.local/bin/$n"; if [ -L "$f" ]; then echo "link $n $(readlink "$f")"; elif [ -e "$f" ]; then echo "file $n"; fi; done; ss -ltn 2>/dev/null | awk "NR>1{print \"port \" \$4}"') \
     || die "can't reach $alias non-interactively (needs key auth)"
   [[ $info == *python3=yes* ]] || die "$alias has no python3"
   local rshell rc
@@ -138,9 +155,11 @@ $foreign"
   mkdir -p -m 700 "$HOSTS"
   local hf port token
   hf=$(host_file "$alias")
+  local names=""
   if [[ -f $hf ]]; then
     port=$(json_get "$hf" port)
     token=$(json_get "$hf" token_hex)
+    names=$(python3 -c 'import json,sys; print(" ".join(json.load(open(sys.argv[1])).get("also", [])))' "$hf")
   else
     local used
     used=$(print -r -- "$info" | sed -n 's/^port .*:\([0-9]*\)$/\1/p')
@@ -163,8 +182,11 @@ $foreign"
   trap 'rollback' ZERR
   trap - ERR
 
-  (umask 077; print -r -- "{\"host\": \"$alias\", \"port\": $port, \"token_hex\": \"$token\"}" > "$hf")
-  write_block "$alias" "$port"
+  for n in $also; do [[ " $names " == *" $n "* ]] || names+=" $n"; done
+  names=${names# }
+  (umask 077; python3 -c 'import json,sys; json.dump({"host": sys.argv[1], "port": int(sys.argv[2]), "token_hex": sys.argv[3], "also": sys.argv[4].split()}, open(sys.argv[5], "w"))' \
+    "$alias" "$port" "$token" "$names" "$hf")
+  write_block "$alias" "$port" "$names"
   mkdir -p -m 700 "$HOME/.ssh/cm"
 
   # Drop any master started before the forward existed, so the next connection carries it.
@@ -191,7 +213,7 @@ cmd_remove() {
   if [[ -n $port ]]; then
     "${SSH[@]}" -O cancel -R "127.0.0.1:$port:127.0.0.1:$MAC_PORT" "$alias" 2>/dev/null || true
   fi
-  "${SSH[@]}" -o ControlPath=none "$alias" 'cd ~/.local/bin 2>/dev/null && for n in xclip xsel pbpaste; do [ -L "$n" ] && [ "$(readlink "$n")" = clipbridge-shim ] && rm -f "$n"; done; rm -f ~/.local/bin/clipbridge-shim; rm -rf ~/.config/clipbridge; for f in ~/.zshrc ~/.bashrc; do [ -f "$f" ] && awk "/^# clipbridge begin\$/{s=1;next} /^# clipbridge end\$/{s=0;next} !s" "$f" > "$f.cb-tmp" && cat "$f.cb-tmp" > "$f" && rm "$f.cb-tmp"; done; true' \
+  "${SSH[@]}" -o ControlPath=none -o ClearAllForwardings=yes "$alias" 'cd ~/.local/bin 2>/dev/null && for n in xclip xsel pbpaste; do [ -L "$n" ] && [ "$(readlink "$n")" = clipbridge-shim ] && rm -f "$n"; done; rm -f ~/.local/bin/clipbridge-shim; rm -rf ~/.config/clipbridge; for f in ~/.zshrc ~/.bashrc; do [ -f "$f" ] && awk "/^# clipbridge begin\$/{s=1;next} /^# clipbridge end\$/{s=0;next} !s" "$f" > "$f.cb-tmp" && cat "$f.cb-tmp" > "$f" && rm "$f.cb-tmp"; done; true' \
     || say "warning: couldn't clean up $alias remotely"
   if grep -qx "$(block_begin "$alias")" "$SSHCONF"; then
     cp -p "$SSHCONF" "$SSHCONF.bak-clipbridge-$(date +%Y%m%d-%H%M%S)"
